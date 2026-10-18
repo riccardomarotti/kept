@@ -37,6 +37,7 @@ type StoredResource<T> = {
   key: string;
   partition: string;
   syncId: string;
+  noteId?: number;
   value: T;
 };
 
@@ -50,7 +51,7 @@ type SyncState = {
 @Injectable({ providedIn: 'root' })
 export class OfflineStoreService {
   private readonly databaseName = 'kept-offline-v1';
-  private readonly databaseVersion = 2;
+  private readonly databaseVersion = 3;
   private database?: Promise<IDBDatabase>;
   private lastStampPhysicalMs = 0;
   private lastStampLogical = 0;
@@ -110,7 +111,7 @@ export class OfflineStoreService {
     await this.transaction(db, ['notes', 'reminders', 'attachments', 'syncState'], 'readwrite', stores => {
       notes.forEach(note => {
         const syncId = this.ensureNoteIdentity(note);
-        stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, value: note });
+        stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, noteId: note.id, value: note });
       });
       reminders.forEach(reminder => {
         const syncId = this.ensureReminderIdentity(reminder);
@@ -148,7 +149,7 @@ export class OfflineStoreService {
       await this.transaction(db, ['notes'], 'readwrite', stores => {
         byIdentity.forEach(note => {
           const syncId = this.ensureNoteIdentity(note);
-          stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, value: note });
+          stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, noteId: note.id, value: note });
         });
       });
     }
@@ -160,15 +161,13 @@ export class OfflineStoreService {
   }
 
   async getNote(partition: string, id: number) {
-    const notes = await this.listNotes(partition);
-    return notes.find(note => note.id === id);
+    const records = await this.noteRecordsById(partition, id);
+    return records.map(record => record.value).reduce<NoteI | undefined>((best, value) => (best ? this.preferNote(best, value) : value), undefined);
   }
 
   async putNote(partition: string, note: NoteI) {
     const syncId = this.ensureNoteIdentity(note);
-    const existing = note.id != null
-      ? (await this.listRecords<NoteI>('notes', partition)).filter(record => record.value.id === note.id)
-      : [];
+    const existing = note.id != null ? await this.noteRecordsById(partition, note.id) : [];
     const preferred = existing.reduce<NoteI | undefined>((best, record) => {
       if (!best) return record.value;
       return this.preferNote(best, record.value);
@@ -179,21 +178,19 @@ export class OfflineStoreService {
       existing
         .filter(record => record.syncId !== syncId)
         .forEach(record => stores['notes'].delete(record.key));
-      stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, value });
+      stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, noteId: note.id, value });
     });
   }
 
   async overwriteNoteMetadata(partition: string, note: NoteI) {
     const syncId = this.ensureNoteIdentity(note);
-    const existing = note.id != null
-      ? (await this.listRecords<NoteI>('notes', partition)).filter(record => record.value.id === note.id)
-      : [];
+    const existing = note.id != null ? await this.noteRecordsById(partition, note.id) : [];
     const db = await this.open();
     await this.transaction(db, ['notes'], 'readwrite', stores => {
       existing
         .filter(record => record.syncId !== syncId)
         .forEach(record => stores['notes'].delete(record.key));
-      stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, value: note });
+      stores['notes'].put({ key: this.resourceKey(partition, syncId), partition, syncId, noteId: note.id, value: note });
     });
   }
 
@@ -309,6 +306,12 @@ export class OfflineStoreService {
 
   async cacheMedia(partition: string, canonicalUrl: string, requestUrl: string) {
     if (!canonicalUrl || canonicalUrl.startsWith('data:') || canonicalUrl.startsWith('blob:')) return;
+    // Uploads use a unique randomized filename, so a cached blob is immutable:
+    // skip the download entirely when it is already stored.
+    try {
+      const existing = await this.getBlob(partition, `media:${canonicalUrl}`);
+      if (existing) return;
+    } catch {}
     try {
       const response = await fetch(requestUrl);
       if (!response.ok) return;
@@ -389,6 +392,15 @@ export class OfflineStoreService {
     return this.listByPartition<StoredResource<T>>(storeName, partition);
   }
 
+  // Looks up note records by server id through the `noteId` index instead of
+  // scanning the whole partition, so every note write stays O(1) in library size.
+  private async noteRecordsById(partition: string, noteId: number) {
+    const db = await this.open();
+    const index = db.transaction('notes').objectStore('notes').index('noteId');
+    const records = await this.request<StoredResource<NoteI>[]>(index.getAll(IDBKeyRange.only(noteId)));
+    return records.filter(record => record.partition === partition);
+  }
+
   private preferNote(left: NoteI, right: NoteI) {
     const leftStamp = Number(left.lwwPhysicalMs || Date.parse(left.updatedAt || '') || 0);
     const rightStamp = Number(right.lwwPhysicalMs || Date.parse(right.updatedAt || '') || 0);
@@ -461,6 +473,20 @@ export class OfflineStoreService {
             }
           }
           if (!db.objectStoreNames.contains('syncState')) db.createObjectStore('syncState', { keyPath: 'key' });
+          const notesStore = request.transaction?.objectStore('notes');
+          if (notesStore) {
+            if (!notesStore.indexNames.contains('noteId')) notesStore.createIndex('noteId', 'noteId', { unique: false });
+            // Backfill the denormalized note id on records written by older versions.
+            const backfill = notesStore.openCursor();
+            backfill.onsuccess = () => {
+              const cursor = backfill.result;
+              if (!cursor) return;
+              const record = cursor.value as StoredResource<NoteI>;
+              const noteId = record?.value?.id;
+              if (typeof noteId === 'number' && record.noteId !== noteId) cursor.update({ ...record, noteId });
+              cursor.continue();
+            };
+          }
         };
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
