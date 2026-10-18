@@ -163,8 +163,9 @@ export class ReminderService {
       const reminders = await firstValueFrom(
         this.http.get<ReminderI[]>(`${this.apiUrl}/reminders`, { headers: this.auth.authHeaders() })
       );
-      if (this.offlineSync.partition) {
-        for (const reminder of reminders) await this.offlineStore.putReminder(this.offlineSync.partition, reminder);
+      const partition = this.offlineSync.partition;
+      if (partition) {
+        await Promise.all(reminders.map(reminder => this.offlineStore.putReminder(partition, reminder)));
       }
       this.setReminders(reminders);
       this.offlineSync.syncNow({ bootstrapIfEmpty: true }).catch(console.error);

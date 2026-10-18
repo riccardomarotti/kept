@@ -69,7 +69,16 @@ export class NotesService {
   private preloadedPreviewUrls = new Set<string>();
   private previewPreloadQueue: string[] = [];
   private previewPreloadRunning = false;
-  private suppressedRealtimeReloads = new Map<number, number>();
+  // Notes we have written to recently: their realtime echoes are coalesced into
+  // a single deferred refresh instead of one reload per save.
+  private selfWriteWindows = new Map<number, number>();
+  private readonly selfWriteWindowMs = 3000;
+  private readonly realtimeRefreshDebounceMs = 250;
+  private readonly realtimeRemindersDebounceMs = 400;
+  private realtimeRefreshTimer?: ReturnType<typeof setTimeout>;
+  private realtimeRemindersTimer?: ReturnType<typeof setTimeout>;
+  private pendingRealtimeFullReload = false;
+  private pendingRealtimeNoteIds = new Set<number>();
   private suppressedRealtimeCreates = new Map<string, number>();
   private suppressNextReorderReloadUntil = 0;
   private optimisticNotes = new Map<number, NoteI>();
@@ -239,7 +248,7 @@ export class NotesService {
         if (message.type === 'notes-changed') {
           if (message.action === 'access-revoked') {
             this.removeNoteFromListAndCache(Number(message.noteId), String(message.syncId || '')).catch(console.error);
-            this.reminders.load().catch(console.error);
+            this.scheduleRealtimeRemindersRefresh();
             return;
           }
           if (message.action === 'reordered' && this.suppressNextReorderReloadUntil > Date.now()) {
@@ -247,9 +256,8 @@ export class NotesService {
             return;
           }
           if (this.shouldSuppressRealtimeCreate(message)) return;
-          if (this.consumeSuppressedRealtimeReload(message.noteId)) return;
-          this.load();
-          this.reminders.load().catch(console.error);
+          this.scheduleRealtimeRefresh(message);
+          this.scheduleRealtimeRemindersRefresh();
         }
         if (message.type === 'reminder-fired') this.reminders.handleFired(message);
         if (message.type === 'presence-update') this.activeEditors$.next({ noteId: message.noteId, editors: message.activeEditors || [] });
@@ -412,6 +420,13 @@ export class NotesService {
   private disconnectRealtime() {
     this.shouldReconnectRealtime = false;
     if (this.realtimeReconnect) clearTimeout(this.realtimeReconnect);
+    if (this.realtimeRefreshTimer) clearTimeout(this.realtimeRefreshTimer);
+    if (this.realtimeRemindersTimer) clearTimeout(this.realtimeRemindersTimer);
+    this.realtimeRefreshTimer = undefined;
+    this.realtimeRemindersTimer = undefined;
+    this.pendingRealtimeFullReload = false;
+    this.pendingRealtimeNoteIds.clear();
+    this.selfWriteWindows.clear();
     this.realtimeSocket?.close();
     this.realtimeSocket = undefined;
   }
@@ -511,7 +526,7 @@ export class NotesService {
       this.mergeNoteIntoList({ ...object, id });
       this.scheduleIosReminderRefresh(id);
     } catch (error) {
-      this.suppressedRealtimeReloads.delete(id);
+      this.selfWriteWindows.delete(id);
       if (this.auth.notifySessionExpired(error)) throw error;
       if (this.isOfflineError(error)) {
         this.offlineSync.markConnectionDegraded();
@@ -550,7 +565,7 @@ export class NotesService {
       this.mergeNoteIntoList({ ...object, id } as NoteI);
       this.scheduleIosReminderRefresh(id);
     } catch (error) {
-      this.suppressedRealtimeReloads.delete(id);
+      this.selfWriteWindows.delete(id);
       if (this.auth.notifySessionExpired(error)) throw error;
       if (this.isOfflineError(error)) {
         this.offlineSync.markConnectionDegraded();
@@ -914,15 +929,84 @@ export class NotesService {
   }
 
   private suppressRealtimeReload(noteId: number) {
-    this.suppressedRealtimeReloads.set(noteId, Date.now() + 5000);
+    this.selfWriteWindows.set(noteId, Date.now() + this.selfWriteWindowMs);
   }
 
-  private consumeSuppressedRealtimeReload(noteId: number) {
-    const id = Number(noteId);
-    const expiresAt = this.suppressedRealtimeReloads.get(id);
-    if (!expiresAt) return false;
-    this.suppressedRealtimeReloads.delete(id);
-    return expiresAt > Date.now();
+  private selfWritesActive() {
+    const now = Date.now();
+    let active = false;
+    this.selfWriteWindows.forEach((until, noteId) => {
+      if (until <= now) this.selfWriteWindows.delete(noteId);
+      else active = true;
+    });
+    return active;
+  }
+
+  // Realtime updates are coalesced: a burst of `notes-changed` messages (our own
+  // writes echoing back, collaborative edits, imports) results in one refresh
+  // instead of a full reload per message. While we are writing a note ourselves,
+  // the refresh is deferred until those writes settle so a reload never lands on
+  // top of edits that are still in flight.
+  private scheduleRealtimeRefresh(message: { action?: string; noteId?: unknown }) {
+    const noteId = Number(message.noteId);
+    const singleNote = Number.isFinite(noteId) && noteId > 0
+      && (message.action === 'updated' || message.action === 'view-state-updated');
+    if (singleNote) this.pendingRealtimeNoteIds.add(noteId);
+    else this.pendingRealtimeFullReload = true;
+    this.armRealtimeRefreshTimer();
+  }
+
+  private armRealtimeRefreshTimer() {
+    if (this.realtimeRefreshTimer) clearTimeout(this.realtimeRefreshTimer);
+    const now = Date.now();
+    let pendingUntil = 0;
+    this.selfWriteWindows.forEach((until, noteId) => {
+      if (until <= now) this.selfWriteWindows.delete(noteId);
+      else pendingUntil = Math.max(pendingUntil, until);
+    });
+    const delay = pendingUntil > now
+      ? Math.min(pendingUntil - now, this.selfWriteWindowMs) + this.realtimeRefreshDebounceMs
+      : this.realtimeRefreshDebounceMs;
+    this.realtimeRefreshTimer = setTimeout(() => this.flushRealtimeRefresh(), delay);
+  }
+
+  private flushRealtimeRefresh() {
+    this.realtimeRefreshTimer = undefined;
+    if (this.selfWritesActive()) {
+      // Still writing our own changes: reconcile once after they settle.
+      this.armRealtimeRefreshTimer();
+      return;
+    }
+    const full = this.pendingRealtimeFullReload;
+    this.pendingRealtimeFullReload = false;
+    const noteIds = [...this.pendingRealtimeNoteIds];
+    this.pendingRealtimeNoteIds.clear();
+    if (!full && !noteIds.length) return;
+    if (full || !noteIds.length) {
+      this.load().catch(console.error);
+      return;
+    }
+    noteIds.forEach(noteId => this.refreshNoteFromRealtime(noteId).catch(console.error));
+  }
+
+  // A single `updated` message only needs that one note refetched; anything that
+  // can change the membership of the list (create, delete, reorder, labels...)
+  // needs a full reload instead.
+  private async refreshNoteFromRealtime(noteId: number) {
+    const known = (this.notesList$.value || []).some(note => note.id === noteId);
+    if (!known) {
+      await this.load();
+      return;
+    }
+    await this.get(noteId);
+  }
+
+  private scheduleRealtimeRemindersRefresh() {
+    if (this.realtimeRemindersTimer) return;
+    this.realtimeRemindersTimer = setTimeout(() => {
+      this.realtimeRemindersTimer = undefined;
+      this.reminders.load().catch(console.error);
+    }, this.realtimeRemindersDebounceMs);
   }
 
   private scheduleIosReminderRefresh(noteId: number) {
