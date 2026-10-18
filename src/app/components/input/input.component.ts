@@ -489,7 +489,7 @@ export class InputComponent implements OnInit {
       this.addCheckBoxFromPlaceholder()
     }
     const checkBoxesForSave = this.currentCheckBoxesForSave(closeAfterSave)
-    const labelsForSave = await this.labelsForSave()
+    const labelsForSave = await this.labelsForSave(closeAfterSave)
     let noteObj: NoteI = {
       noteTitle: this.noteTitle.nativeElement.innerHTML,
       noteBody: this.noteBody?.nativeElement.innerHTML ? this.cleanEditorBodyForSave(this.noteBody.nativeElement.innerHTML) : '',
@@ -675,9 +675,18 @@ export class InputComponent implements OnInit {
       .map(label => ({ id: label.id, name: label.name, added: true }))
   }
 
-  private async labelsForSave() {
+  private async labelsForSave(closeAfterSave = true) {
     const selectedLabels = this.labels.filter(label => label.added)
     if (!this.isEditing || !this.noteToEdit?.id || this.labelsDirty) return selectedLabels
+
+    // Incremental autosave must stay cheap: skip the extra note fetch and reuse
+    // the list copy (kept fresh by realtime updates). Only the final save on
+    // close re-reads the authoritative server value before writing, and shared
+    // notes keep doing that on every save.
+    if (!closeAfterSave && !this.isSharedEditingNote()) {
+      const cached = this.notesService.notesList$.value?.find(note => note.id === this.noteToEdit.id)
+      return this.normalizeLabels(cached?.labels || this.noteToEdit.labels || selectedLabels)
+    }
 
     try {
       const fresh = await this.notesService.get(this.noteToEdit.id, { merge: false })
@@ -1867,7 +1876,9 @@ export class InputComponent implements OnInit {
   }
 
   private queueCoEditAutosave() {
-    if (!this.isEditing || !this.noteToEdit.id || !this.isSharedEditingNote()) return
+    // Autosave every edit, not only collaborative ones: the note is persisted
+    // while typing instead of only when the editor closes.
+    if (!this.isEditing || !this.noteToEdit.id) return
     this.autoSaveSubject.next()
   }
 
@@ -3573,9 +3584,7 @@ export class InputComponent implements OnInit {
         }
       });
       this.autoSaveSubscription = this.autoSaveSubject.pipe(debounceTime(550)).subscribe(() => {
-        if (this.isSharedEditingNote()) {
-          this.saveNote(false);
-        }
+        this.saveNote(false);
       });
       this.notesListSubscription = this.notesService.notesList$.subscribe(notes => {
         if (!notes) return;
