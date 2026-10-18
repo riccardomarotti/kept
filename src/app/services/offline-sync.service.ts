@@ -169,11 +169,12 @@ export class OfflineSyncService {
         payload: entry.payload,
         lww: entry.lww
       }))
-    }, { headers: this.auth.authHeaders() })), this.syncRequestTimeoutMs);
+    }, { headers: this.auth.authHeaders(), params: { snapshot: '0' } })), this.syncRequestTimeoutMs);
     const completed = entries.filter((entry, index) => response.results?.[index]?.ok);
     await this.store.removeOutbox(completed.map(entry => entry.key));
     const failed = response.results?.find(result => !result.ok);
     if (!failed && response.snapshot) {
+      // Older servers still answer with the full snapshot on every flush.
       await this.store.replaceSnapshot(
         this.currentPartition,
         response.snapshot.notes || [],
@@ -184,11 +185,55 @@ export class OfflineSyncService {
       );
       await this.cacheSnapshotMedia(response.snapshot.notes || []);
       this.cacheChanged$.next();
-    } else if (response.serverTime) {
-      const state = await this.store.getSyncState(this.currentPartition);
-      await this.store.setSyncState(this.currentPartition, state.cursor, response.serverTime);
+    } else {
+      // The snapshot-free path: replay the mutations we just committed into the
+      // cache. pullChanges() runs right after this and brings the authoritative
+      // server rows, so this only keeps the UI fresh in the meantime.
+      if (completed.length) {
+        await this.applyFlushedMutations(completed, response.results);
+        this.cacheChanged$.next();
+      }
+      if (response.serverTime) {
+        const state = await this.store.getSyncState(this.currentPartition);
+        await this.store.setSyncState(this.currentPartition, state.cursor, response.serverTime);
+      }
     }
     if (failed) throw new Error(failed.error || 'A queued change could not be synchronized.');
+  }
+
+  private async applyFlushedMutations(entries: OutboxEntry[], results: Array<{ ok?: boolean; id?: number; skipped?: boolean }> | undefined) {
+    if (!this.currentPartition) return;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (results?.[index]?.skipped) continue;
+      const resultId = results?.[index]?.id;
+      switch (entry.type) {
+        case 'note.upsert': {
+          const note = entry.payload as NoteI | null;
+          if (!note) break;
+          await this.store.putNote(this.currentPartition, resultId != null ? { ...note, id: resultId } : note);
+          break;
+        }
+        case 'note.delete':
+          await this.store.deleteNote(this.currentPartition, entry.syncId);
+          break;
+        case 'reminder.upsert': {
+          const reminder = entry.payload as ReminderI | null;
+          if (!reminder) break;
+          await this.store.putReminder(this.currentPartition, resultId != null ? { ...reminder, id: resultId } : reminder);
+          break;
+        }
+        case 'reminder.delete':
+          await this.store.deleteReminder(this.currentPartition, entry.syncId);
+          break;
+        case 'attachment.delete':
+          await this.store.deleteAttachment(this.currentPartition, entry.syncId);
+          break;
+        default:
+          // note.reorder and attachment.upload need no cache rewrite here.
+          break;
+      }
+    }
   }
 
   private async flushAttachmentUploads(entries: OutboxEntry[]) {

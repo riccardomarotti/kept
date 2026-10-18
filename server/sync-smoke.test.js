@@ -421,6 +421,77 @@ async function main() {
     const changes = await request(`/sync/changes?cursor=${Math.max(0, deleted.snapshot.cursor - 1)}`, { headers });
     assert(changes.changes.some(change => change.resourceSyncId === 'lww-note' && change.operation === 'delete'), 'change stream should include delete tombstone');
 
+    // Snapshot-free mutation flush: the web client sends `snapshot=0` and
+    // reconciles through the change stream instead of downloading the whole
+    // library on every mutation.
+    const cursorBeforeSnapshotFree = await request('/sync/changes?cursor=0&limit=1', { headers });
+    const snapshotFree = await request('/sync/mutations?snapshot=0', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        mutations: [{
+          type: 'note.upsert',
+          syncId: 'snapshot-free-note',
+          payload: {
+            syncId: 'snapshot-free-note',
+            id: -(now + 1),
+            noteTitle: 'Snapshot free',
+            noteBody: 'Created without snapshot',
+            pinned: false,
+            bgColor: '',
+            bgImage: '',
+            checkBoxes: [],
+            images: [],
+            isCbox: false,
+            labels: [],
+            archived: false,
+            trashed: false
+          },
+          lww: { physicalMs: now + 1000, logical: 0, deviceId: 'smoke-device', operationId: 'snapshot-free-op' }
+        }]
+      })
+    });
+    assert(!Object.prototype.hasOwnProperty.call(snapshotFree, 'snapshot'), 'snapshot=0 must omit the full snapshot');
+    assert(snapshotFree.results.every(result => result.ok), JSON.stringify(snapshotFree.results));
+    assert(Number.isFinite(snapshotFree.serverTime), 'snapshot-free response should still report serverTime');
+    const snapshotFreeNote = await request(`/notes/${snapshotFree.results[0].id}`, { headers });
+    assert.strictEqual(snapshotFreeNote.noteTitle, 'Snapshot free');
+    const snapshotFreeChanges = await request(`/sync/changes?cursor=${cursorBeforeSnapshotFree.serverCursor}&limit=500`, { headers });
+    assert(
+      snapshotFreeChanges.changes.some(change => change.resourceSyncId === 'snapshot-free-note' && change.operation === 'upsert'),
+      'change stream should include notes written without a snapshot'
+    );
+    // Native clients keep the previous behaviour: the snapshot is still here
+    // unless the caller explicitly opts out.
+    const withSnapshot = await request('/sync/mutations', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        mutations: [{
+          type: 'note.upsert',
+          syncId: 'snapshot-free-note',
+          payload: {
+            syncId: 'snapshot-free-note',
+            id: snapshotFree.results[0].id,
+            noteTitle: 'Snapshot free',
+            noteBody: 'Updated with snapshot',
+            pinned: false,
+            bgColor: '',
+            bgImage: '',
+            checkBoxes: [],
+            images: [],
+            isCbox: false,
+            labels: [],
+            archived: false,
+            trashed: false
+          },
+          lww: { physicalMs: now + 2000, logical: 0, deviceId: 'smoke-device', operationId: 'snapshot-free-op-2' }
+        }]
+      })
+    });
+    assert(withSnapshot.snapshot, 'default mutations response should keep the snapshot');
+    assert(withSnapshot.snapshot.notes.some(item => item.syncId === 'snapshot-free-note'), 'snapshot should contain the updated note');
+
     console.log('Sync smoke tests passed.');
   } finally {
     child.kill('SIGTERM');

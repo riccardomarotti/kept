@@ -5440,12 +5440,16 @@ app.post('/api/sync/mutations', requireAuth, asyncRoute(async (req, res) => {
       results[index] = { ok: false, status: 500, error: error.message || 'Sync mutation failed.', type: mutation.type };
     }
   }
-  const snapshot = await syncSnapshotForUser(req.user.id);
+  // Callers that reconcile through /api/sync/changes can pass `snapshot=0` and
+  // skip serializing the whole library on every mutation flush. Native clients
+  // keep the previous behaviour (full snapshot) unless they opt out.
+  const includeSnapshot = String(req.query.snapshot ?? '1') !== '0';
+  const snapshot = includeSnapshot ? await syncSnapshotForUser(req.user.id) : undefined;
   if (process.env.KEPT_TEST_MODE === '1' && req.get('x-kept-test-drop-response') === '1') {
     req.socket.destroy();
     return;
   }
-  res.json({ results, serverTime: Date.now(), snapshot });
+  res.json({ results, serverTime: Date.now(), ...(includeSnapshot ? { snapshot } : {}) });
 }));
 
 
