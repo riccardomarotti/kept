@@ -294,6 +294,9 @@
           <button type="button" class="dc-confirm" (click)="confirmPendingDate()">Pick time →</button>
         </div>
       }
+      @if (saveStatus !== 'idle') {
+        <span class="save-status" [class.is-error]="saveStatus === 'error'" role="status" aria-live="polite">{{ saveStatusText() }}</span>
+      }
       <button type="button" class="close-btn" [disabled]="!canSaveNote || closeSaveBusy" [attr.aria-busy]="closeSaveBusy" (click)="saveNote()">{{ closeSaveBusy ? 'Saving…' : 'Close' }}</button>
     </div>
 
