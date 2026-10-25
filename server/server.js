@@ -5293,7 +5293,8 @@ async function applySyncNoteMutation(userId, mutation) {
     await recordNoteSyncChange(row.id, 'upsert', [userId]);
     broadcastRealtime([userId], { type: 'notes-changed', action: 'updated', noteId: row.id });
     return { ok: true, resourceType: 'note-view-state', syncId, id: row.id,
-      payload: { syncId, completedChecklistCollapsed: Boolean(collapsed), updatedAt: now } };
+      payload: { syncId, completedChecklistCollapsed: Boolean(collapsed), updatedAt: now },
+      canonical: dbNoteToApi(note) };
   }
   if (type === 'note.reorder') {
     const syncIds = Array.isArray(payload.syncIds) ? payload.syncIds.map(String).filter(Boolean) : [];
@@ -5328,7 +5329,7 @@ async function applySyncNoteMutation(userId, mutation) {
     : await get('SELECT * FROM notes WHERE syncId = ? OR id = ?', [syncId, Number(payload.id || mutation.id || 0)]);
   if (existing && !(await getAccessibleNote(existing.id, userId))) return { ok: false, status: 403, error: 'Note not accessible.', syncId };
   if (existing && compareLwwStamp(incomingStamp, rowLwwStamp(existing)) < 0) {
-    return { ok: true, skipped: true, resourceType: 'note', syncId, id: existing.id };
+    return { ok: true, skipped: true, resourceType: 'note', syncId, id: existing.id, payload: dbNoteToApi(await getAccessibleNote(existing.id, userId)) };
   }
   if (type === 'note.delete') {
     const note = existing ? await getAccessibleNote(existing.id, userId) : null;
@@ -5497,7 +5498,7 @@ async function applySyncReminderMutation(userId, mutation) {
     return { ok: false, status: 409, error: 'Reminder schedule changed.', syncId, latest: await enrichReminderResponse(existing) };
   }
   if (existing && compareLwwStamp(incomingStamp, rowLwwStamp(existing)) < 0) {
-    return { ok: true, skipped: true, resourceType: 'reminder', syncId, id: existing.id };
+    return { ok: true, skipped: true, resourceType: 'reminder', syncId, id: existing.id, payload: await enrichReminderResponse(existing) };
   }
   if (type === 'reminder.delete') {
     if (!existing || existing.userId !== userId) return { ok: true, skipped: true, resourceType: 'reminder', syncId };
@@ -5544,7 +5545,7 @@ async function applySyncReminderMutation(userId, mutation) {
       return { ok: false, status: 409, error: 'Reminder schedule changed.', syncId, latest: await enrichReminderResponse(existing) };
     }
     if (existing && compareLwwStamp(incomingStamp, rowLwwStamp(existing)) < 0) {
-      return { ok: true, skipped: true, resourceType: 'reminder', syncId: existing.syncId, id: existing.id };
+      return { ok: true, skipped: true, resourceType: 'reminder', syncId: existing.syncId, id: existing.id, payload: await enrichReminderResponse(existing) };
     }
   }
   const now = new Date().toISOString();
@@ -5682,7 +5683,7 @@ async function applySyncAttachmentMutation(userId, mutation) {
   if (!attachment) return { ok: true, skipped: true, resourceType: 'attachment', syncId };
   const incomingStamp = normalizeLwwStamp(mutation.lww || payload);
   if (compareLwwStamp(incomingStamp, rowLwwStamp(attachment)) < 0) {
-    return { ok: true, skipped: true, resourceType: 'attachment', syncId, id: attachment.id };
+    return { ok: true, skipped: true, resourceType: 'attachment', syncId, id: attachment.id, payload: attachmentResponse(attachment) };
   }
   const recipients = await getNoteRecipientIds(attachment.noteId);
   const filePath = attachmentPath(attachment.storedFilename);
@@ -5754,7 +5755,7 @@ async function applyWorkspaceReminderOccurrence(userId,mutation) {
       WHERE id = ? AND userId = ?`, [next || due,next ? 'pending' : 'fired',new Date().toISOString(),stamp.physicalMs,stamp.logical,stamp.deviceId,stamp.operationId,reminder.id,userId]);
     await recordReminderSyncChange(await get('SELECT * FROM reminders WHERE id = ?', [reminder.id]),'upsert');
   }
-  return {ok:true,resourceType:'reminder',syncId:reminder.syncId,id:reminder.id};
+  return {ok:true,resourceType:'reminder',syncId:reminder.syncId,id:reminder.id,payload:await enrichReminderResponse(await get('SELECT * FROM reminders WHERE id = ?', [reminder.id]))};
 }
 
 async function persistReminderOccurrence(reminder) {
@@ -5820,7 +5821,7 @@ async function applyReminderOccurrenceAction(userId, payload) {
   }
   await run('UPDATE reminder_occurrences SET state = ?, snoozeUntil = ? WHERE occurrenceId = ? AND userId = ?',
     [payload.state, payload.state === 'snoozed' ? new Date(snoozeTime).toISOString() : null, row.occurrenceId, userId]);
-  return { ok: true, resourceType: 'reminder-occurrence', syncId: row.occurrenceId };
+  return { ok: true, resourceType: 'reminder-occurrence', syncId: row.occurrenceId, payload: await enrichReminderResponse(reminder) };
 }
 
 app.get('/api/client/capabilities', requireAuth, (_req, res) => res.json({
@@ -5873,15 +5874,19 @@ app.post('/api/sync/mutations', requireAuth, asyncRoute(async (req, res) => {
       results[index] = { ok: false, status: 500, error: error.message || 'Sync mutation failed.', type: mutation.type };
     }
   }
-  const snapshot = await withDatabaseTransaction(async () => {
+  // Local-first clients receive the canonical resource per result and can ask
+  // to skip the full snapshot transfer on every flush; legacy clients keep
+  // receiving the snapshot by default.
+  const wantSnapshot = req.body?.snapshot !== false;
+  const snapshot = wantSnapshot ? await withDatabaseTransaction(async () => {
     const extra = v2 ? await workspaceSync.resources(req.user.id) : {};
     return { ...await syncSnapshotForUser(req.user.id), ...extra };
-  });
+  }) : undefined;
   if (process.env.KEPT_TEST_MODE === '1' && req.get('x-kept-test-drop-response') === '1') {
     req.socket.destroy();
     return;
   }
-  res.json({ ...(v2 ? { protocolVersion: 2 } : {}), results, serverTime: Date.now(), snapshot });
+  res.json({ ...(v2 ? { protocolVersion: 2 } : {}), results, serverTime: Date.now(), ...(wantSnapshot ? { snapshot } : {}) });
 }));
 
 

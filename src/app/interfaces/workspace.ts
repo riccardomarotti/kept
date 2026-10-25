@@ -67,4 +67,6 @@ export interface MutationOutcome {
   syncId?: string;
   id?: number;
   canonical?: Record<string, unknown> | null;
+  /** Canonical resource echo, sent instead of a full snapshot when possible. */
+  payload?: Record<string, unknown> | null;
 }

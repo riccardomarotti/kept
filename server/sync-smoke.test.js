@@ -294,6 +294,43 @@ async function main() {
     });
     assert.strictEqual(olderResult.results[0].skipped, true, 'older LWW write should be skipped');
     assert.strictEqual(olderResult.snapshot.notes.find(item => item.syncId === 'lww-note').noteTitle, 'newer');
+    assert.strictEqual(olderResult.results[0].payload.noteTitle, 'newer', 'skipped writes should echo the canonical resource without a snapshot');
+
+    // Local-first flushes skip the full snapshot transfer; every result must
+    // still carry the canonical resource so the client can converge.
+    const slimFlush = await request('/sync/mutations', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        protocolVersion: 2,
+        snapshot: false,
+        mutations: [{
+          type: 'note.upsert',
+          syncId: 'slim-note',
+          payload: {
+            syncId: 'slim-note',
+            noteTitle: 'Slim',
+            noteBody: '',
+            pinned: false,
+            bgColor: '',
+            bgImage: '',
+            checkBoxes: [],
+            images: [],
+            isCbox: false,
+            labels: [],
+            archived: false,
+            trashed: false
+          },
+          lww: { physicalMs: newer + 10, logical: 0, deviceId: 'a', operationId: 'slim' }
+        }]
+      })
+    });
+    assert.strictEqual(slimFlush.snapshot, undefined, 'snapshot: false must not return the whole library');
+    assert.strictEqual(slimFlush.results[0].ok, true);
+    assert.strictEqual(slimFlush.results[0].payload.noteTitle, 'Slim', 'results echo the canonical resource');
+
+    const slimChanges = await request(`/sync/changes?cursor=0&protocolVersion=2`, { headers });
+    assert(slimChanges.changes.some(change => change.resourceSyncId === 'slim-note'), 'slim flush must still record sync changes');
 
     const sharedNote = await request('/notes', {
       method: 'POST',

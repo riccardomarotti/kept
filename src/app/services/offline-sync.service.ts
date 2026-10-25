@@ -386,12 +386,17 @@ export class OfflineSyncService implements OnDestroy {
 
   private async flushMutations(entries: OutboxEntry[]) {
     if (!this.currentPartition || !entries.length) return;
+    // Results echo the canonical resource per mutation; the full snapshot is
+    // only requested while the local cache is still cold. This keeps an
+    // ordinary save from transferring the entire library.
+    const coldCache = (await this.store.getSyncState(this.currentPartition)).cursor === 0;
     const response = await this.withTimeout(firstValueFrom(this.http.post<{
       protocolVersion?: number; results: MutationOutcome[];
       serverTime: number;
       snapshot?: SyncSnapshot;
     }>(`${this.apiUrl}/sync/mutations`, {
       protocolVersion: 2,
+      snapshot: coldCache ? undefined : false,
       mutations: entries.map(entry => ({
         operationId: entry.operationId,
         type: entry.type,
@@ -405,9 +410,11 @@ export class OfflineSyncService implements OnDestroy {
     const results = (response.results || []).map((result, index) => {
       const entry = entries[index];
       const type = entry?.type.split('.')[0] as ResourceType;
-      const canonical = snapshot?.[type]?.find(value => value['syncId'] === entry.syncId);
+      const canonical = result.canonical !== undefined ? result.canonical
+        : result.payload !== undefined ? result.payload
+        : snapshot?.[type]?.find(value => value['syncId'] === entry.syncId);
       return { ...result, operationId: result.operationId || entry?.operationId,
-        ...(canonical ? { canonical } : {}) };
+        ...(canonical !== undefined ? { canonical } : {}) };
     });
     const summary = await perf.time('sync.reconcile', 'mutations', () => this.store.reconcile(workspace, { results, sent: entries, snapshot,
       cursor: response.snapshot?.cursor, serverTime: response.serverTime }));
