@@ -100,7 +100,7 @@ export class NotesService {
         this.load().catch(console.error);
       } else if (user) {
         this.connectRealtime(user.token);
-        this.publishCachedNotes(this.searchQuery).catch(console.error);
+        this.scheduleFullPublish().catch(console.error);
       } else {
         if (this.iosReminderRefreshTimer) clearTimeout(this.iosReminderRefreshTimer);
         this.iosReminderRefreshTimer = undefined;
@@ -118,7 +118,8 @@ export class NotesService {
     if (this.offlineSync.writesLocally) {
       await this.auth.workspace.ready;
       this.searchQuery = searchQuery;
-      await this.publishCachedNotes(searchQuery);
+      // Concurrent startup loads share one cache read/publish.
+      await this.scheduleFullPublish();
       this.loading = false; this.loadError = false;
       if (!this.auth.isLocal) void this.offlineSync.syncNow({ bootstrapIfEmpty: true }).catch(console.error);
       return;
@@ -1329,15 +1330,25 @@ export class NotesService {
   }
 
   private publishScheduled?: Promise<void>;
+  private publishScheduledQuery?: string;
 
   /** Coalesce full publishes so a mutation and its sync echo refresh once. */
   private scheduleFullPublish(): Promise<void> {
-    if (!this.publishScheduled) {
-      this.publishScheduled = this.publishCachedNotes(this.searchQuery, 'cache-change')
-        .catch(console.error)
-        .finally(() => { this.publishScheduled = undefined; });
-    }
-    return this.publishScheduled;
+    const query = this.searchQuery;
+    if (this.publishScheduled && this.publishScheduledQuery === query) return this.publishScheduled;
+    const previous = this.publishScheduled;
+    // Chain behind any in-flight publish so a changed search query is not lost.
+    const run = (previous || Promise.resolve()).catch(() => undefined)
+      .then(() => this.publishCachedNotes(query, 'cache-change').catch(console.error));
+    const settled: Promise<void> = run.finally(() => {
+      if (this.publishScheduled === settled) {
+        this.publishScheduled = undefined;
+        this.publishScheduledQuery = undefined;
+      }
+    });
+    this.publishScheduledQuery = query;
+    this.publishScheduled = settled;
+    return settled;
   }
 
   /** Refresh only what a cache change touched instead of the whole library. */

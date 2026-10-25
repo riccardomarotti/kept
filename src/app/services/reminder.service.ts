@@ -177,8 +177,18 @@ export class ReminderService {
     this.listenForAndroidResume();
   }
 
+  private loadPromise?: Promise<void>;
+
   async load() {
     if (this.offlineSync.writesLocally) { await this.loadCachedReminders(); return; }
+    // Coalesce redundant reload bursts (realtime echoes, startup fan-out)
+    // into one request at a time.
+    if (this.loadPromise) return this.loadPromise;
+    this.loadPromise = this.fetchReminders().finally(() => { this.loadPromise = undefined; });
+    return this.loadPromise;
+  }
+
+  private async fetchReminders() {
     try {
       const reminders = await firstValueFrom(
         this.http.get<ReminderI[]>(`${this.apiUrl}/reminders`, { headers: this.auth.authHeaders() })

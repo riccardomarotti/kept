@@ -3319,10 +3319,25 @@ export class InputComponent implements OnInit {
   }
 
   private persistCboxDragOrder() {
+    // A drop can land before the last coalesced dragover ran: place the row
+    // first, then persist, so the cursor-to-row placement is exact.
+    this.flushPendingCboxReorder()
     if (!this.cboxDragOrderChanged) return
     this.pushCboxHistorySnapshot()
     this.noteToEdit.checkBoxes = this.checkBoxes
     this.queueAutosave()
+  }
+
+  private flushPendingCboxReorder() {
+    if (this.cboxReorderFrame !== undefined) {
+      cancelAnimationFrame(this.cboxReorderFrame)
+      this.cboxReorderFrame = undefined
+    }
+    const pending = this.pendingCboxReorder
+    this.pendingCboxReorder = undefined
+    if (pending && this.draggedCboxId !== undefined) {
+      this.processCboxReorder(pending.id, pending.isDone, pending.clientY)
+    }
   }
 
   private clearCboxDragState() {
