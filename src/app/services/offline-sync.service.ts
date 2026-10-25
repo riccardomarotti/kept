@@ -6,10 +6,26 @@ import { environment } from 'src/environments/environment';
 import { NoteAttachmentI, NoteI } from '../interfaces/notes';
 import { ReminderI } from '../interfaces/reminder';
 import { AuthService } from './auth.service';
-import { OfflineStoreService, OutboxEntry } from './offline-store.service';
+import { OfflineStoreService, OutboxEntry, ReconcileSummary } from './offline-store.service';
+import { perf } from '../utils/perf';
 import { Workspace, ResourceType, ResourceChange, MutationOutcome, NativeAction } from '../interfaces/workspace';
 
-export type OfflineSyncState = 'offline' | 'syncing' | 'saved' | 'error';
+export type OfflineSyncState = 'offline' | 'syncing' | 'saved' | 'pending' | 'error';
+
+/**
+ * Scoped cache invalidation: which parts of the local projection changed.
+ * `undefined` (or `full`) means consumers must refresh everything.
+ */
+export interface CacheChange {
+  /** Affected note sync ids; an empty array means no note changed. */
+  noteSyncIds?: string[];
+  reminders?: boolean;
+  labels?: boolean;
+  binders?: boolean;
+  savedPlaces?: boolean;
+  preferences?: boolean;
+  full?: boolean;
+}
 
 type SyncAppPlugin = {
   addListener(event: 'resume' | 'appStateChange', callback: (state?: { isActive?: boolean }) => void): Promise<PluginListenerHandle>;
@@ -30,9 +46,10 @@ type SyncChange = ResourceChange;
 @Injectable({ providedIn: 'root' })
 export class OfflineSyncService implements OnDestroy {
   readonly state$ = new BehaviorSubject<OfflineSyncState>(navigator.onLine ? 'saved' : 'offline');
-  readonly cacheChanged$ = new Subject<void>();
+  readonly cacheChanged$ = new Subject<CacheChange | undefined>();
   private readonly apiUrl = environment.apiUrl;
   private readonly syncRequestTimeoutMs = 12000;
+  private readonly recoveryFreshWindowMs = 5000;
   private degradedUntil = 0;
   private connectionUnavailable = !navigator.onLine;
   private retryTimer?: ReturnType<typeof setTimeout>;
@@ -40,6 +57,8 @@ export class OfflineSyncService implements OnDestroy {
   private readonly retryDelays = [5000, 15000, 30000];
   private running = false;
   private rerun = false;
+  private runHasBootstrapIntent = false;
+  private lastSyncSettledAt = 0;
   private bootstrapIfEmptyRequested = false;
   private currentPartition = '';
   protocolVersion = 1;
@@ -87,7 +106,7 @@ export class OfflineSyncService implements OnDestroy {
       if (!user && previous && !previous.startsWith('local:') && !this.currentPartition) {
         this.store.listOutbox(previous).then(pending => { if (!pending.length) return this.store.purgePartition(previous); return undefined; }).catch(console.error);
       }
-      if (this.auth.isLocal) { if (previous !== this.currentPartition || this.state$.value !== 'error') this.state$.next('saved'); this.cacheChanged$.next(); }
+      if (this.auth.isLocal) { if (previous !== this.currentPartition || this.state$.value !== 'error') this.state$.next('saved'); this.cacheChanged$.next(undefined); }
       if (user) this.syncNow({ bootstrapIfEmpty: true }).catch(console.error);
     });
     window.addEventListener('online', this.recoverConnection);
@@ -142,12 +161,36 @@ export class OfflineSyncService implements OnDestroy {
 
   async commit<T extends Record<string, any>>(type: OutboxEntry['type'], syncId: string, payload: T, options?: { blobs?: Array<{ key: string; value: Blob }>; attachments?: Record<string,any>[]; action?: NativeAction }): Promise<T> {
     try {
-      const value = await this.store.commitMutation(await this.workspace(), type, syncId, payload, options);
-      this.cacheChanged$.next();
+      const workspace = await this.workspace();
+      const value = await perf.time('sync.commit', type, () => this.store.commitMutation(workspace, type, syncId, payload, options));
+      this.cacheChanged$.next(this.cacheChangeForMutation(type, syncId, payload));
       if (this.auth.isLocal) this.state$.next('saved');
-      else void this.syncNow().catch(console.error);
+      else {
+        // The edit is durably committed on this device; the server copy is
+        // still pending until the outbox drains.
+        if (this.state$.value === 'saved') this.state$.next('pending');
+        void this.syncNow({ drain: true, reason: 'commit' }).catch(console.error);
+      }
       return value;
     } catch (error) { this.state$.next('error'); throw error; }
+  }
+
+  private cacheChangeForMutation(type: OutboxEntry['type'], syncId: string, payload: Record<string, any>): CacheChange {
+    const resource = type.split('.')[0];
+    if (resource === 'note') {
+      return type === 'note.reorder' ? { full: true } : { noteSyncIds: [syncId], reminders: type === 'note.delete' };
+    }
+    if (resource === 'reminder') {
+      const noteSyncId = (payload as any)?.noteSyncId;
+      return { noteSyncIds: noteSyncId ? [noteSyncId] : [], reminders: true };
+    }
+    if (resource === 'attachment') {
+      const noteSyncId = (payload as any)?.noteSyncId;
+      return { noteSyncIds: noteSyncId ? [noteSyncId] : [], reminders: false };
+    }
+    if (resource === 'preferences') return { noteSyncIds: [], preferences: true };
+    // Label, binder, saved-place and image rewrites can touch many notes.
+    return { full: true };
   }
 
   isConnectionDegraded() {
@@ -174,14 +217,14 @@ export class OfflineSyncService implements OnDestroy {
     if (!this.running) queueMicrotask(() => this.syncNow().catch(console.error));
   }
 
-  async enqueue(type: OutboxEntry['type'], syncId: string, payload: unknown) {
+  async enqueue(type: OutboxEntry['type'], syncId: string, payload: unknown, options: { deferSync?: boolean } = {}) {
     if (this.auth.isLocal) { this.state$.next('saved'); return this.store.nextStamp(0); }
     if (!this.currentPartition) throw new Error('No active offline partition.');
     try {
       const syncState = await this.store.getSyncState(this.currentPartition);
       const stamp = this.store.nextStamp(syncState.serverOffsetMs);
       await this.store.enqueue(this.currentPartition, type, syncId, payload, stamp);
-      this.syncNow().catch(console.error);
+      if (!options.deferSync) this.syncNow({ drain: true, reason: 'enqueue' }).catch(console.error);
       return stamp;
     } catch (error) {
       this.clearRetryTimer();
@@ -190,19 +233,32 @@ export class OfflineSyncService implements OnDestroy {
     }
   }
 
-  async syncNow(options: { bootstrapIfEmpty?: boolean; recovery?: boolean } = {}) {
+  async syncNow(options: { bootstrapIfEmpty?: boolean; recovery?: boolean; drain?: boolean; reason?: string } = {}) {
     if (this.destroyed || this.auth.isLocal || !this.auth.currentUser || !this.currentPartition) return;
+    const reason = options.reason || (options.recovery ? 'recovery' : options.drain ? 'commit' : options.bootstrapIfEmpty ? 'startup' : 'manual');
     if (options.bootstrapIfEmpty) this.bootstrapIfEmptyRequested = true;
     if (!navigator.onLine) {
       this.markConnectionDegraded();
       return;
     }
     if (this.running) {
-      if (!options.recovery) this.rerun = true;
+      // Coalesce duplicate triggers. Only new local work (an outbox entry
+      // added mid-run) or an unattended bootstrap intent needs another pass.
+      if (options.drain) this.rerun = true;
+      else if (options.bootstrapIfEmpty && !this.runHasBootstrapIntent) this.rerun = true;
+      else perf.count('sync.trigger.coalesced', reason);
       return;
     }
     if (this.connectionUnavailable && !options.recovery) {
       this.scheduleDegradedRetries();
+      return;
+    }
+    // A visibility/online recovery right after a settled, fully synced cycle
+    // covers the same state and must not launch a duplicate synchronization.
+    if (options.recovery && this.state$.value === 'saved' && !this.isConnectionDegraded() &&
+        this.lastSyncSettledAt && Date.now() - this.lastSyncSettledAt < this.recoveryFreshWindowMs &&
+        !this.bootstrapIfEmptyRequested && !(await this.store.listOutbox(this.currentPartition)).length) {
+      perf.count('sync.trigger.coalesced', 'recent-success');
       return;
     }
     this.clearRetryTimer();
@@ -211,27 +267,30 @@ export class OfflineSyncService implements OnDestroy {
     const identity = {partition:this.partition,userId:this.auth.currentUser?.id,epoch:this.epoch,headers:this.auth.authHeaders()};
     const bootstrapIfEmpty = this.bootstrapIfEmptyRequested;
     this.bootstrapIfEmptyRequested = false;
+    this.runHasBootstrapIntent = bootstrapIfEmpty;
     if (!this.connectionUnavailable) this.state$.next('syncing');
     try {
-      const workspace = await this.workspace();
-      this.protocolVersion = workspace.protocolVersion || this.protocolVersion;
-      if (identity.epoch !== this.epoch || workspace.partition !== identity.partition) {const error = new Error('Workspace changed.');error.name='StaleSyncResponse';throw error;}
-      this.activeContext = {...identity,workspace};
-      const state = await this.store.getSyncState(this.currentPartition);
-      const cachedNotes = bootstrapIfEmpty ? await this.store.listNotes(this.currentPartition) : [];
-      const pending = await this.store.listOutbox(this.currentPartition);
-      if (!pending.length && (state.cursor === 0 || (bootstrapIfEmpty && cachedNotes.length === 0))) {
-        await this.bootstrap();
-      }
-      await this.flushOutbox();
-      await this.pullChanges();
+      await perf.time('sync.cycle', reason, async () => {
+        const workspace = await this.workspace();
+        this.protocolVersion = workspace.protocolVersion || this.protocolVersion;
+        if (identity.epoch !== this.epoch || workspace.partition !== identity.partition) {const error = new Error('Workspace changed.');error.name='StaleSyncResponse';throw error;}
+        this.activeContext = {...identity,workspace};
+        const state = await this.store.getSyncState(this.currentPartition);
+        const cachedNotes = bootstrapIfEmpty ? await this.store.listNotes(this.currentPartition) : [];
+        const pending = await this.store.listOutbox(this.currentPartition);
+        if (!pending.length && (state.cursor === 0 || (bootstrapIfEmpty && cachedNotes.length === 0))) {
+          await this.bootstrap();
+        }
+        await this.flushOutbox();
+        await this.pullChanges();
+      });
       if (this.destroyed) return;
       if (!navigator.onLine) this.markConnectionDegraded();
       else {
         this.clearConnectionDegraded();
         this.retryAttempt = 0;
         this.clearRetryTimer();
-        if (!this.rerun) this.state$.next('saved');
+        this.lastSyncSettledAt = Date.now();
       }
     } catch (error) {
       if (this.destroyed || (error instanceof Error && error.name === 'StaleSyncResponse')) return;
@@ -250,48 +309,79 @@ export class OfflineSyncService implements OnDestroy {
       this.activeContext = undefined;
       if (this.rerun) {
         this.rerun = false;
-        queueMicrotask(() => this.syncNow().catch(console.error));
+        const stillWanted = this.bootstrapIfEmptyRequested || !!(await this.store.listOutbox(this.currentPartition).catch(() => [])).length;
+        if (stillWanted) queueMicrotask(() => this.syncNow({ drain: true, reason: 'rerun' }).catch(console.error));
+        else perf.count('sync.rerun.skipped');
       }
+      await this.settleSyncState();
     }
+  }
+
+  /** Publish the truthful end state once no sync work is scheduled anymore. */
+  private async settleSyncState() {
+    if (this.destroyed || this.auth.isLocal || this.running || this.rerun) return;
+    if (this.state$.value !== 'syncing') return;
+    if (!navigator.onLine || this.isConnectionDegraded()) { this.state$.next('offline'); return; }
+    const pending = await this.store.listOutbox(this.currentPartition).catch(() => []);
+    // A follow-up cycle may have started or finished while the outbox was read.
+    if (this.running || this.rerun || this.state$.value !== 'syncing') return;
+    this.state$.next(pending.length ? 'pending' : 'saved');
   }
 
   async bootstrap() {
     if (!this.currentPartition) return;
-    const snapshot = await this.withTimeout(
-      firstValueFrom(this.http.get<SyncSnapshot>(`${this.apiUrl}/sync/bootstrap`, {
-        headers: this.requestHeaders(), params: { protocolVersion: '2' }
-      })),
-      this.syncRequestTimeoutMs
-    );
-    const workspace = this.activeContext?.workspace || await this.workspace();
-    await this.store.reconcile(workspace, { snapshot: this.snapshotResources(snapshot), cursor: snapshot.cursor || 0, serverTime: snapshot.serverTime });
-    if (snapshot.protocolVersion === 2) {
-      this.protocolVersion = 2;
-      await this.store.patchWorkspace(workspace.id, { protocolVersion: 2 });
-      try { localStorage.setItem(`kept_sync_protocol:${workspace.partition}`,'2'); } catch {}
-    }
-    await this.applyCachedPreferences(workspace);
-    await this.cacheSnapshotMedia(snapshot.notes || [],workspace.partition);
-    this.cacheChanged$.next();
+    await perf.time('sync.bootstrap', 'bootstrap', async () => {
+      const snapshot = await this.withTimeout(
+        firstValueFrom(this.http.get<SyncSnapshot>(`${this.apiUrl}/sync/bootstrap`, {
+          headers: this.requestHeaders(), params: { protocolVersion: '2' }
+        })),
+        this.syncRequestTimeoutMs
+      );
+      const workspace = this.activeContext?.workspace || await this.workspace();
+      await this.store.reconcile(workspace, { snapshot: this.snapshotResources(snapshot), cursor: snapshot.cursor || 0, serverTime: snapshot.serverTime });
+      if (snapshot.protocolVersion === 2) {
+        this.protocolVersion = 2;
+        await this.store.patchWorkspace(workspace.id, { protocolVersion: 2 });
+        try { localStorage.setItem(`kept_sync_protocol:${workspace.partition}`,'2'); } catch {}
+      }
+      await this.applyCachedPreferences(workspace);
+      await perf.time('sync.mediaHydration', 'snapshot', () => this.cacheSnapshotMedia(snapshot.notes || [], workspace.partition));
+    });
+    // A snapshot can change everything; consumers must refresh in full.
+    this.cacheChanged$.next(undefined);
+  }
+
+  private cacheChangeFromSummary(summary: ReconcileSummary | undefined): CacheChange | undefined {
+    if (!summary) return undefined;
+    return {
+      noteSyncIds: [...summary.noteSyncIds],
+      reminders: summary.remindersChanged,
+      labels: summary.labelsChanged,
+      binders: summary.bindersChanged,
+      savedPlaces: summary.savedPlacesChanged,
+      preferences: summary.preferencesChanged
+    };
   }
 
   private async flushOutbox() {
     if (!this.currentPartition) return;
-    let entries = await this.store.listOutbox(this.currentPartition);
-    const workspace = this.activeContext?.workspace || await this.workspace();
-    for (const entry of entries.filter(entry => entry.type === 'image.upload')) {
-      const payload = entry.payload as any;
-      const blob = await this.store.getBlob(workspace.partition, `media:${payload.url}`);
-      if (!blob) throw new Error('An outgoing image is missing from device storage.');
-      const form = new FormData(); form.append('image',blob,payload.filename || 'image'); form.append('operationId',entry.operationId);
-      const uploaded = await this.withTimeout(firstValueFrom(this.http.post<{url:string}>(`${this.apiUrl}/uploads/images`,form,{headers:this.auth.authHeaders()})),this.syncRequestTimeoutMs);
-      await this.store.acknowledgeImage(workspace,entry,uploaded.url);
-    }
-    entries = await this.store.listOutbox(workspace.partition);
-    const uploads = entries.filter(entry => entry.type === 'attachment.upload' || entry.type === 'attachment.upsert');
-    const mutations = entries.filter(entry => !['image.upload','attachment.upload','attachment.upsert'].includes(entry.type));
-    for (let offset = 0; offset < mutations.length; offset += 500) await this.flushMutations(mutations.slice(offset,offset + 500));
-    if (uploads.length) await this.flushAttachmentUploads(uploads);
+    await perf.time('sync.flushOutbox', 'flush', async () => {
+      let entries = await this.store.listOutbox(this.currentPartition);
+      const workspace = this.activeContext?.workspace || await this.workspace();
+      for (const entry of entries.filter(entry => entry.type === 'image.upload')) {
+        const payload = entry.payload as any;
+        const blob = await this.store.getBlob(workspace.partition, `media:${payload.url}`);
+        if (!blob) throw new Error('An outgoing image is missing from device storage.');
+        const form = new FormData(); form.append('image',blob,payload.filename || 'image'); form.append('operationId',entry.operationId);
+        const uploaded = await this.withTimeout(firstValueFrom(this.http.post<{url:string}>(`${this.apiUrl}/uploads/images`,form,{headers:this.auth.authHeaders()})),this.syncRequestTimeoutMs);
+        await this.store.acknowledgeImage(workspace,entry,uploaded.url);
+      }
+      entries = await this.store.listOutbox(workspace.partition);
+      const uploads = entries.filter(entry => entry.type === 'attachment.upload' || entry.type === 'attachment.upsert');
+      const mutations = entries.filter(entry => !['image.upload','attachment.upload','attachment.upsert'].includes(entry.type));
+      for (let offset = 0; offset < mutations.length; offset += 500) await this.flushMutations(mutations.slice(offset,offset + 500));
+      if (uploads.length) await this.flushAttachmentUploads(uploads);
+    });
   }
 
   private async flushMutations(entries: OutboxEntry[]) {
@@ -319,9 +409,9 @@ export class OfflineSyncService implements OnDestroy {
       return { ...result, operationId: result.operationId || entry?.operationId,
         ...(canonical ? { canonical } : {}) };
     });
-    await this.store.reconcile(workspace, { results, sent: entries, snapshot,
-      cursor: response.snapshot?.cursor, serverTime: response.serverTime });
-    this.cacheChanged$.next();
+    const summary = await perf.time('sync.reconcile', 'mutations', () => this.store.reconcile(workspace, { results, sent: entries, snapshot,
+      cursor: response.snapshot?.cursor, serverTime: response.serverTime }));
+    if (!summary || summary.changed) this.cacheChanged$.next(this.cacheChangeFromSummary(summary));
     const pendingIds = new Set((await this.store.listOutbox(workspace.partition)).map(entry=>entry.operationId));
     const failed = results.find(result => !result.ok && pendingIds.has(result.operationId));
     if (failed) throw new Error(failed.error || 'A queued change could not be synchronized.');
@@ -362,8 +452,8 @@ export class OfflineSyncService implements OnDestroy {
         this.syncRequestTimeoutMs
       );
       await this.store.putBlob(workspace.partition, `attachment:${entry.syncId}`, blob);
-      await this.store.reconcile(workspace,{sent:[entry],results:[{ok:true,operationId:entry.operationId,canonical:attachment as any}]});
-      this.cacheChanged$.next();
+      const summary = await this.store.reconcile(workspace,{sent:[entry],results:[{ok:true,operationId:entry.operationId,canonical:attachment as any}]});
+      if (!summary || summary.changed) this.cacheChanged$.next(this.cacheChangeFromSummary(summary));
     }
   }
 
@@ -371,8 +461,22 @@ export class OfflineSyncService implements OnDestroy {
     if (!this.currentPartition) return;
     let state = await this.store.getSyncState(this.currentPartition);
     let hasMore = true;
+    let changed = false;
+    let change: CacheChange = { noteSyncIds: [] };
+    const accumulate = (summary: ReconcileSummary | undefined) => {
+      if (!summary) { changed = true; change = { full: true }; return; }
+      if (!summary.changed) return;
+      changed = true;
+      if (change.full) return;
+      change.noteSyncIds!.push(...summary.noteSyncIds);
+      change.reminders = !!change.reminders || summary.remindersChanged;
+      change.labels = !!change.labels || summary.labelsChanged;
+      change.binders = !!change.binders || summary.bindersChanged;
+      change.savedPlaces = !!change.savedPlaces || summary.savedPlacesChanged;
+      change.preferences = !!change.preferences || summary.preferencesChanged;
+    };
     while (hasMore) {
-      const response = await this.withTimeout(firstValueFrom(this.http.get<{
+      const response = await perf.time('sync.pullChanges', 'pull', () => this.withTimeout(firstValueFrom(this.http.get<{
         protocolVersion?: number; changes: SyncChange[];
         cursor: number;
         hasMore: boolean;
@@ -380,17 +484,31 @@ export class OfflineSyncService implements OnDestroy {
       }>(`${this.apiUrl}/sync/changes`, {
         headers: this.requestHeaders(),
         params: { cursor: String(state.cursor), limit: '500', protocolVersion: '2' }
-      })), this.syncRequestTimeoutMs);
+      })), this.syncRequestTimeoutMs));
       const workspace = this.activeContext?.workspace || await this.workspace();
-      await this.store.reconcile(workspace, { changes: response.changes || [], cursor: response.cursor ?? state.cursor, serverTime: response.serverTime });
+      const changes = response.changes || [];
+      const cursor = response.cursor ?? state.cursor;
+      if (!changes.length && cursor <= state.cursor) {
+        // No remote changes and no consumed sequence numbers: keep only the
+        // server clock offset fresh with one small write. No reconcile
+        // transaction and no cache invalidation are needed.
+        perf.count('sync.pull.noop');
+        await this.store.setSyncState(this.currentPartition, state.cursor, response.serverTime);
+      } else {
+        const summary = await perf.time('sync.reconcile', 'changes', () => this.store.reconcile(workspace, { changes, cursor, serverTime: response.serverTime }));
+        accumulate(summary);
+      }
       if (response.protocolVersion === 2 && this.protocolVersion !== 2) {
         await this.bootstrap();
+        changed = false;
+        change = { noteSyncIds: [] };
       }
       state = await this.store.getSyncState(this.currentPartition);
       hasMore = !!response.hasMore;
     }
     await this.applyCachedPreferences(await this.workspace());
-    this.cacheChanged$.next();
+    // Only invalidate the cached projections that actually changed.
+    if (changed) this.cacheChanged$.next(change.full ? undefined : change);
   }
 
   private async applyCachedPreferences(workspace: Workspace) {

@@ -19,6 +19,27 @@ class HttpErrorResponse extends Error {
 const failure = status => rx.throwError(() => new HttpErrorResponse({ status }));
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+// Loads relative TypeScript imports (e.g. ../utils/perf) inside the sandbox.
+const moduleCache = new Map();
+function loadRelativeModule(specifier, fromDir) {
+  const filename = path.resolve(fromDir, specifier + '.ts');
+  if (moduleCache.has(filename)) return moduleCache.get(filename).exports;
+  const record = { exports: {} };
+  moduleCache.set(filename, record);
+  const compiled = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, experimentalDecorators: true }
+  }).outputText;
+  vm.runInNewContext(compiled, {
+    exports: record.exports, console, performance: globalThis.performance,
+    setTimeout, clearTimeout, queueMicrotask,
+    require(name) {
+      if (name.startsWith('.')) return loadRelativeModule(name, path.dirname(filename));
+      throw new Error(`Unexpected runtime import: ${name}`);
+    }
+  }, { filename });
+  return record.exports;
+}
+
 function harness(t, platform = 'web', initiallyOnline = true) {
   const clock = {
     now: 100000, nextId: 0, timers: new Map(),
@@ -102,6 +123,7 @@ function harness(t, platform = 'web', initiallyOnline = true) {
       };
       if (name === 'rxjs') return rx;
       if (name.endsWith('/environment')) return { environment: { apiUrl: '/api' } };
+      if (name.startsWith('.')) return loadRelativeModule(name, path.join(__dirname, '../src/app/services'));
       throw new Error(`Unexpected runtime import: ${name}`);
     }
   };
