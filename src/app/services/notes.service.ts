@@ -1274,8 +1274,8 @@ export class NotesService {
   async delete(id: number) {
     if (this.offlineSync.writesLocally) {
       const value = await this.offlineStore.getNote(this.offlineSync.partition, id);
-      this.reminders.markNoteInactive(id);
       if (value?.syncId) await this.offlineSync.commit('note.delete', value.syncId, value);
+      // Also cancels reminder timers for the removed note.
       this.removeNoteFromListAndCache(id, value?.syncId || '').catch(console.error);
       await this.reminders.load(); return;
     }

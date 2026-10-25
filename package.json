@@ -12,6 +12,7 @@
     "test:invite": "node server/invite.test.js",
     "test:integration-requests": "node --test server/integration-requests.test.js",
     "test:offline-sync-status": "node --test scripts/offline-sync-status.test.cjs",
+    "test:performance": "node --test scripts/offline-reconcile.test.cjs scripts/offline-sync-scheduler.test.cjs scripts/notes-service-incremental.test.cjs",
     "test:uuid": "node --test src/app/utils/uuid.test.ts",
     "test:uuid:http": "node scripts/uuid-http-test.mjs",
     "test:native": "node server/native-client.test.js",
