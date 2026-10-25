@@ -225,6 +225,10 @@ export class InputComponent implements OnInit {
   private cboxTouchStartY = 0;
   private cboxTouchIndentHandled = false;
   private cboxTouchStartIndent = 0;
+  private pendingCboxReorder?: { id: number; isDone: boolean; clientY: number };
+  private cboxReorderFrame?: number;
+  private cboxRowElements = new Map<number, HTMLElement>();
+  private cboxRowRects = new Map<number, DOMRect>();
   private pendingCboxFocusPoint?: { id: number, x: number, y: number };
   private pendingCboxFocusRange?: Range;
   private cboxTextTouch?: { id: number, x: number, y: number, moved: boolean, wasFocused: boolean, disabledEditing: boolean };
@@ -897,6 +901,7 @@ export class InputComponent implements OnInit {
     this.checkBoxes = [...this.checkBoxes]
     this.noteToEdit.checkBoxes = this.checkBoxes
     this.cd.detectChanges()
+    this.invalidateCboxRowRects()
 
     if (options.commit !== false) {
       this.pushCboxHistorySnapshot()
@@ -939,6 +944,13 @@ export class InputComponent implements OnInit {
       ? 0
       : Math.min(Math.round(absDx / indentWidth), MAX_INDENT_LEVEL)
     const targetIndent = this.cboxTouchStartIndent + (rawDx < 0 ? -levelDelta : levelDelta)
+    // Skip the expensive DOM sync + change detection when the clamped level
+    // would not change (the usual case once the indent gesture latches).
+    const index = this.checkBoxes.findIndex(cb => cb.id === this.draggedCboxId)
+    if (index < 0) return true
+    const currentIndent = this.checkboxIndentLevel(this.checkBoxes[index])
+    const nextIndent = Math.min(normalizeIndentLevel(targetIndent), maxIndentLevelAt(this.checkBoxes, index))
+    if (nextIndent === currentIndent) return true
     const changed = this.setCboxIndentLevel(this.draggedCboxId, targetIndent, { commit: false })
     if (changed) {
       this.cboxDragOrderChanged = true
@@ -2088,6 +2100,8 @@ export class InputComponent implements OnInit {
     this.cboxTouchStartX = event.clientX
     this.cboxTouchStartY = event.clientY
     this.cboxTouchStartIndent = this.checkboxIndentLevel(this.checkBoxes.find(cb => cb.id === id))
+    this.ensureCboxRowElements()
+    this.ensureCboxRowRects()
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = 'move'
       const row = event.currentTarget as HTMLElement
@@ -3169,7 +3183,9 @@ export class InputComponent implements OnInit {
       this.dragReadyCboxId = id
       this.cboxTouchDragging = true
       this.cboxTouchStartIndent = this.checkboxIndentLevel(this.checkBoxes.find(cb => cb.id === id))
-      const row = document.querySelector<HTMLElement>(`[data-cbox-row-id="${id}"]`)
+      this.ensureCboxRowElements()
+      this.ensureCboxRowRects()
+      const row = this.cboxRowElements.get(id) || document.querySelector<HTMLElement>(`[data-cbox-row-id="${id}"]`)
       if (row) {
         this.createCboxDragImage(row, this.cboxTouchStartX, this.cboxTouchStartY)
         this.moveCboxDragImageToPoint(this.cboxTouchStartX, this.cboxTouchStartY)
@@ -3216,13 +3232,47 @@ export class InputComponent implements OnInit {
 
   private reorderCboxAround(id: number, isDone: boolean, clientY: number) {
     if (this.draggedCboxId === undefined) return
-    const draggedCb = this.checkBoxes.find(cb => cb.id === this.draggedCboxId)
-    if (!draggedCb || !this.cboxSectionMatches(draggedCb, isDone)) return
-    if (id === this.draggedCboxId) return
+    // dragover/touchmove fire far more often than frames: coalesce them and
+    // run at most one reorder computation per animation frame.
+    this.pendingCboxReorder = { id, isDone, clientY }
+    if (this.cboxReorderFrame !== undefined) return
+    this.cboxReorderFrame = requestAnimationFrame(() => {
+      this.cboxReorderFrame = undefined
+      const pending = this.pendingCboxReorder
+      this.pendingCboxReorder = undefined
+      if (pending && this.draggedCboxId !== undefined) this.processCboxReorder(pending.id, pending.isDone, pending.clientY)
+    })
+  }
 
-    const row = document.querySelector<HTMLElement>(`[data-cbox-row-id="${id}"]`)
-    if (!row) return
-    const rect = row.getBoundingClientRect()
+  /** Row elements are stable while dragging (rows are tracked by id). */
+  private ensureCboxRowElements() {
+    if (this.cboxRowElements.size) return
+    document.querySelectorAll<HTMLElement>('[data-cbox-row-id]').forEach(row => {
+      const id = Number(row.dataset['cboxRowId'])
+      if (!Number.isNaN(id)) this.cboxRowElements.set(id, row)
+    })
+  }
+
+  /** Batch all geometry reads into one pass; invalidated on real layout changes. */
+  private ensureCboxRowRects() {
+    if (this.cboxRowRects.size) return
+    this.ensureCboxRowElements()
+    this.cboxRowElements.forEach((row, id) => this.cboxRowRects.set(id, row.getBoundingClientRect()))
+  }
+
+  private invalidateCboxRowRects() {
+    this.cboxRowRects.clear()
+  }
+
+  private processCboxReorder(id: number, isDone: boolean, clientY: number) {
+    const draggedId = this.draggedCboxId
+    if (draggedId === undefined) return
+    const draggedCb = this.checkBoxes.find(cb => cb.id === draggedId)
+    if (!draggedCb || !this.cboxSectionMatches(draggedCb, isDone)) return
+    if (id === draggedId) return
+    this.ensureCboxRowRects()
+    const rect = this.cboxRowRects.get(id)
+    if (!rect) return
     const placement: 'before' | 'after' = clientY < rect.top + rect.height / 2 ? 'before' : 'after'
 
     const fromIdx = this.checkBoxes.indexOf(draggedCb)
@@ -3238,12 +3288,18 @@ export class InputComponent implements OnInit {
     const adjustedInsertIdx = insertBeforeIdx > fromIdx ? insertBeforeIdx - 1 : insertBeforeIdx
     if (adjustedInsertIdx === fromIdx) return
 
-    const previousRects = this.getCboxRowRects(isDone)
+    // Only rows between the old and the new position can move.
+    const shifted = new Set<number>()
+    for (let index = Math.min(fromIdx, adjustedInsertIdx); index <= Math.max(fromIdx, adjustedInsertIdx); index++) {
+      shifted.add(this.checkBoxes[index].id)
+    }
+    const previousRects = new Map(this.cboxRowRects)
     const [moved] = this.checkBoxes.splice(fromIdx, 1)
     this.checkBoxes.splice(adjustedInsertIdx, 0, moved)
     this.checkBoxes = normalizeIndentLevels(this.checkBoxes)
     this.checkBoxes = [...this.checkBoxes]
-    this.animateCboxRows(previousRects, this.draggedCboxId)
+    this.invalidateCboxRowRects()
+    this.animateCboxRows(previousRects, draggedId, shifted)
     this.cboxDragOrderChanged = true
   }
 
@@ -3274,6 +3330,13 @@ export class InputComponent implements OnInit {
       clearTimeout(this.cboxTouchTimer)
       this.cboxTouchTimer = undefined
     }
+    if (this.cboxReorderFrame !== undefined) {
+      cancelAnimationFrame(this.cboxReorderFrame)
+      this.cboxReorderFrame = undefined
+    }
+    this.pendingCboxReorder = undefined
+    this.cboxRowElements.clear()
+    this.cboxRowRects.clear()
     this.draggedCboxId = undefined
     this.dragReadyCboxId = undefined
     this.cboxDragOrderChanged = false
@@ -3313,29 +3376,30 @@ export class InputComponent implements OnInit {
     return canvas
   }
 
+
   private getCboxRowRects(isDone: boolean) {
     const rects = new Map<number, DOMRect>()
-    document.querySelectorAll<HTMLElement>('[data-cbox-row-id]').forEach(row => {
-      const id = Number(row.dataset['cboxRowId'])
-      const cb = this.checkBoxes.find(item => item.id === id)
-      if (cb && this.cboxSectionMatches(cb, isDone)) rects.set(id, row.getBoundingClientRect())
+    this.ensureCboxRowRects()
+    this.checkBoxes.forEach(cb => {
+      if (!this.cboxSectionMatches(cb, isDone)) return
+      const rect = this.cboxRowRects.get(cb.id)
+      if (rect) rects.set(cb.id, rect)
     })
     return rects
   }
 
-  private animateCboxRows(previousRects: Map<number, DOMRect>, draggedId: number) {
+  private animateCboxRows(previousRects: Map<number, DOMRect>, draggedId: number, shifted: Set<number>) {
     this.cd.detectChanges()
     requestAnimationFrame(() => {
-      document.querySelectorAll<HTMLElement>('[data-cbox-row-id]').forEach(row => {
-        const id = Number(row.dataset['cboxRowId'])
-        if (id === draggedId) return
-
+      for (const id of shifted) {
+        if (id === draggedId) continue
+        const row = this.cboxRowElements.get(id)
         const previousRect = previousRects.get(id)
-        if (!previousRect) return
+        if (!row || !previousRect) continue
 
         const nextRect = row.getBoundingClientRect()
         const deltaY = previousRect.top - nextRect.top
-        if (!deltaY) return
+        if (!deltaY) continue
 
         // Cancel any in-flight FLIP animation on this row so successive
         // reorders during a fast drag don't queue overlapping animations
@@ -3354,7 +3418,7 @@ export class InputComponent implements OnInit {
           }
         )
         ;(animation as any).id = 'cbox-flip'
-      })
+      }
     })
   }
 

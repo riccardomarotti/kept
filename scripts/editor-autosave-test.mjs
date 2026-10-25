@@ -27,8 +27,16 @@ try {
   await fixture.sql('UPDATE users SET demoNotesCreatedAt = ?', [new Date().toISOString()]);
   browser = await chromium.launch({ headless: true });
   const rows = () => fixture.sql('SELECT id, noteTitle, noteBody, checkBoxes FROM notes ORDER BY id');
-  const saved = async (page, action, method = 'PUT') => {
-    const response = page.waitForResponse(r => /\/api\/notes(?:\/\d+)?$/.test(r.url()) && r.request().method() === method);
+  // Protocol-agnostic: the legacy path writes via /api/notes, local-first
+  // clients journal through /api/sync/mutations.
+  const isNoteWrite = request => {
+    const url = request.url();
+    const method = request.method();
+    return (method === 'POST' && (url.endsWith('/api/notes') || url.endsWith('/api/sync/mutations')))
+      || ((method === 'PUT' || method === 'PATCH') && /\/api\/notes\/\d+$/.test(url));
+  };
+  const saved = async (page, action) => {
+    const response = page.waitForResponse(r => isNoteWrite(r.request()));
     await action();
     assert.equal((await response).ok(), true);
   };
@@ -74,7 +82,7 @@ try {
     const editor = page.locator('app-input .note-main:visible').first();
     const title = editor.getByRole('textbox', { name: 'Title', exact: true });
     const body = editor.locator('.note-body[contenteditable]');
-    await saved(page, () => title.fill(`Autosave ${platform}`), 'POST');
+    await saved(page, () => title.fill(`Autosave ${platform}`));
     assert.equal(await editor.isVisible(), true, 'autosave must leave the composer open');
     assert.equal((await rows()).length, before + 1);
     const id = (await rows()).at(-1).id;
@@ -119,7 +127,7 @@ try {
     await page.getByText(`Autosave ${platform}`, { exact: true }).click();
     let writes = 0;
     const countWrites = request => {
-      if (request.url().endsWith(`/api/notes/${id}`) && request.method() === 'PUT') writes++;
+      if (isNoteWrite(request) && !(request.method() === 'POST' && request.url().endsWith('/api/notes'))) writes++;
     };
     page.on('request', countWrites);
     await api(`/notes/${id}`, collaboratorLogin.token, { noteBody: '<b>Collaborator edit</b>' });
@@ -147,18 +155,26 @@ try {
     // land in the same note after creation completes.
     let releaseCreate;
     const heldCreate = new Promise(resolve => { releaseCreate = resolve; });
-    await page.route('**/api/notes', async route => {
+    const holdIfCreate = async route => {
       if (route.request().method() === 'POST') await heldCreate;
       await route.continue();
-    });
+    };
+    await page.route('**/api/notes', holdIfCreate);
+    await page.route('**/api/sync/mutations', holdIfCreate);
     await page.locator('app-input .placeholder:visible input').click();
-    const createStarted = page.waitForRequest(r => r.url().endsWith('/api/notes') && r.method() === 'POST');
+    const createStarted = page.waitForRequest(r => isNoteWrite(r) && r.method() === 'POST');
     await title.fill(`Race ${platform}`);
     await createStarted;
     await body.fill('Final edit while creating');
     await editor.getByRole('button', { name: 'Close', exact: true }).click();
     releaseCreate();
     await page.locator('app-input .placeholder:visible').waitFor();
+    // Local-first clients flush the journaled create and the follow-up edit
+    // in separate batches; wait until the database caught up.
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await rows()).at(-1)?.noteBody === 'Final edit while creating') break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
     assert.equal((await rows()).length, before + 2);
     assert.equal((await rows()).at(-1).noteBody, 'Final edit while creating');
     await page.reload({ waitUntil: 'domcontentloaded' });
