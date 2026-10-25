@@ -69,9 +69,6 @@ export class NotesService {
   private pendingLoadWaiters: Array<() => void> = [];
   private readonly cardPageSize = 80;
   private shouldReconnectRealtime = false;
-  private preloadedPreviewUrls = new Set<string>();
-  private previewPreloadQueue: string[] = [];
-  private previewPreloadRunning = false;
   private suppressedRealtimeReloads = new Map<number, number>();
   private suppressedRealtimeCreates = new Map<string, number>();
   private suppressNextReorderReloadUntil = 0;
@@ -145,7 +142,6 @@ export class NotesService {
       const notes = this.withOptimisticNotes(page.notes);
       await this.prepareNoteImages(notes);
       this.publishNotes(notes);
-      this.queueLinkPreviewPreload(notes);
       notes.forEach(note => this.cacheNoteMedia(note).catch(console.error));
       this.offlineSync.syncNow({ bootstrapIfEmpty: true }).catch(console.error);
     } catch (error) {
@@ -225,7 +221,6 @@ export class NotesService {
       const merged = [...current, ...page.notes.filter(note => !note.id || !seen.has(note.id))];
       await this.prepareNoteImages(page.notes);
       this.publishNotes(merged);
-      this.queueLinkPreviewPreload(page.notes);
     } finally {
       this.isLoadingNextPage = false;
     }
@@ -988,7 +983,6 @@ export class NotesService {
       ...current.filter(note => !note.id || !incomingIds.has(note.id))
     ];
     this.publishNotes(next);
-    this.queueLinkPreviewPreload(notes);
   }
 
   private publishNotes(notes: NoteI[]) {
@@ -1179,23 +1173,94 @@ export class NotesService {
 
   private linkPreviewCache = new Map<string, Promise<LinkPreviewData>>();
   private linkPreviewResolved = new Map<string, LinkPreviewData>();
+  private linkPreviewFailures = new Map<string, number>();
+  private previewInterest = new Map<string, number>();
+  private previewQueue: Array<{ url: string; resolve: (data: LinkPreviewData) => void; reject: (error: unknown) => void; start: () => Promise<void> }> = [];
+  private previewActive = 0;
+  private readonly linkPreviewConcurrency = 3;
+  private readonly linkPreviewQueueCap = 48;
+  private readonly linkPreviewFailureRetryMs = 60000;
 
   getLinkPreview(url: string): Promise<LinkPreviewData> {
     if (this.auth.isLocal) return Promise.resolve({ title: url, description: null, image: null, url, domain: new URL(url).hostname });
     if (!this.preferences.value.richLinkPreviews) {
+      // Disabled rigorously: never issue preview requests.
       return Promise.reject(new Error('Rich link previews are disabled.'));
     }
-    if (!this.linkPreviewCache.has(url)) {
-      const promise = firstValueFrom(
-        this.http.get<LinkPreviewData>(`${environment.apiUrl}/link-preview`, {
-          params: { url },
-          headers: this.auth.authHeaders()
-        })
-      );
-      this.linkPreviewCache.set(url, promise);
-      promise.then(data => this.linkPreviewResolved.set(url, data)).catch(() => undefined);
+    const cached = this.linkPreviewCache.get(url);
+    if (cached) return cached;
+    const failedAt = this.linkPreviewFailures.get(url);
+    if (failedAt && Date.now() - failedAt < this.linkPreviewFailureRetryMs) {
+      // Failing URLs back off instead of retrying in a loop.
+      return Promise.reject(new Error('The link preview failed recently.'));
     }
-    return this.linkPreviewCache.get(url)!;
+    const promise = this.enqueueLinkPreviewFetch(url);
+    this.linkPreviewCache.set(url, promise);
+    promise.then(data => this.linkPreviewResolved.set(url, data)).catch(() => { this.linkPreviewCache.delete(url); });
+    return promise;
+  }
+
+  /** Register a consumer (visible card, open editor) that awaits a preview. */
+  retainLinkPreview(url: string) {
+    this.previewInterest.set(url, (this.previewInterest.get(url) || 0) + 1);
+  }
+
+  releaseLinkPreview(url: string) {
+    const count = (this.previewInterest.get(url) || 0) - 1;
+    if (count > 0) this.previewInterest.set(url, count);
+    else this.previewInterest.delete(url);
+  }
+
+  private enqueueLinkPreviewFetch(url: string): Promise<LinkPreviewData> {
+    return new Promise<LinkPreviewData>((resolve, reject) => {
+      const start = async () => {
+        try {
+          const data = await firstValueFrom(
+            this.http.get<LinkPreviewData>(`${environment.apiUrl}/link-preview`, {
+              params: { url },
+              headers: this.auth.authHeaders()
+            })
+          );
+          this.linkPreviewFailures.delete(url);
+          resolve(data);
+        } catch (error) {
+          this.linkPreviewFailures.set(url, Date.now());
+          this.linkPreviewCache.delete(url);
+          reject(error);
+        }
+      };
+      if (this.previewActive < this.linkPreviewConcurrency) {
+        this.previewActive += 1;
+        start().finally(() => { this.previewActive -= 1; this.drainPreviewQueue(); });
+      } else if (this.previewQueue.length < this.linkPreviewQueueCap) {
+        this.previewQueue.push({ url, resolve, reject, start });
+      } else {
+        this.linkPreviewFailures.set(url, Date.now());
+        reject(new Error('Too many link previews are queued.'));
+      }
+    });
+  }
+
+  private drainPreviewQueue() {
+    while (this.previewActive < this.linkPreviewConcurrency && this.previewQueue.length) {
+      const next = this.previewQueue.shift()!;
+      if (!this.preferences.value.richLinkPreviews) {
+        // The setting was disabled while queued: cancel the request.
+        this.linkPreviewCache.delete(next.url);
+        perf.count('linkPreview.cancelled', 'disabled');
+        next.reject(new Error('Rich link previews are disabled.'));
+        continue;
+      }
+      if (!this.previewInterest.get(next.url)) {
+        // Navigated away: no visible card or open editor wants this preview.
+        this.linkPreviewCache.delete(next.url);
+        perf.count('linkPreview.cancelled', 'no-consumer');
+        next.reject(new Error('The link preview is no longer needed.'));
+        continue;
+      }
+      this.previewActive += 1;
+      next.start().finally(() => { this.previewActive -= 1; this.drainPreviewQueue(); });
+    }
   }
 
   // Synchronous lookup used by LinkPreviewComponent so it can skip rendering
@@ -1204,60 +1269,6 @@ export class NotesService {
     return this.linkPreviewResolved.get(url) || null;
   }
 
-  private queueLinkPreviewPreload(notes: NoteI[]) {
-    if (!this.preferences.value.richLinkPreviews) return;
-    // Notes arrive sorted by recency / pinned-first, so URLs from the first
-    // ~80 notes are the ones the user is about to see. Queue those first
-    // so IntersectionObserver-based fetches in the rendered LinkPreview
-    // components hit the resolved cache instead of triggering HTTP.
-    const seen = new Set<string>();
-    const prioritized: string[] = [];
-    const deferred: string[] = [];
-    notes.forEach((note, index) => {
-      for (const url of this.noteUrls(note)) {
-        if (seen.has(url) || this.preloadedPreviewUrls.has(url)) continue;
-        seen.add(url);
-        if (index < 80) prioritized.push(url);
-        else deferred.push(url);
-      }
-    });
-    const urls = prioritized.concat(deferred);
-    if (!urls.length) return;
-    urls.forEach(url => this.preloadedPreviewUrls.add(url));
-    this.previewPreloadQueue.push(...urls);
-    if (this.previewPreloadRunning) return;
-    this.previewPreloadRunning = true;
-    // Kick off immediately — no 250ms delay. The frontend has already
-    // painted whatever it can without these previews; getting them back
-    // ASAP just lets the cards fill in faster.
-    queueMicrotask(() => this.preloadLinkPreviews());
-  }
-
-  private async preloadLinkPreviews() {
-    // Run a small pool of fetches in parallel. The browser caps connections
-    // per origin, so 6 is a safe sweet spot — enough to keep the pipeline
-    // full without exhausting the server thread on cold-cache scrapes.
-    const concurrency = 6;
-    const workers: Promise<void>[] = [];
-    const next = async () => {
-      while (this.previewPreloadQueue.length) {
-        const url = this.previewPreloadQueue.shift()!;
-        await this.getLinkPreview(url).catch(() => undefined);
-      }
-    };
-    try {
-      for (let i = 0; i < concurrency; i++) workers.push(next());
-      await Promise.all(workers);
-    } finally {
-      this.previewPreloadRunning = false;
-    }
-  }
-
-  private noteUrls(note: NoteI) {
-    const plainBody = String(note.noteBody || '').replace(/<[^>]+>/g, ' ');
-    const matches = plainBody.match(/https?:\/\/[^\s"'<>]+/g) || [];
-    return [...new Set(matches)].slice(0, 3);
-  }
 
   async importGoogleTakeout(file: File): Promise<TakeoutImportResult> {
     const formData = new FormData();

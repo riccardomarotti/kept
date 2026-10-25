@@ -258,6 +258,7 @@ export class InputComponent implements OnInit {
   private destroyed = false
   private editorPreviewGeneration = 0
   private editorLinkDecorationFrame?: number
+  private editorPreviewUrls = new Set<string>()
   private saveBaselineSnapshot?: string
   private lastExternalUpdateSnapshot?: string
   mobileComposeMode = false
@@ -2261,6 +2262,7 @@ export class InputComponent implements OnInit {
   }
 
   private hydrateEditorLinkPreviews() {
+    this.releaseEditorPreviewInterests()
     if (!this.preferences.value.richLinkPreviews) return
     const body = this.noteBody?.nativeElement
     if (!body || this.destroyed) return
@@ -2270,6 +2272,9 @@ export class InputComponent implements OnInit {
       if (!url) return
       slot.dataset['hydrated'] = 'true'
       slot.replaceChildren(this.editorPreviewShell(url))
+      // Registered so queued previews are cancelled when the editor closes.
+      this.notesService.retainLinkPreview(url)
+      this.editorPreviewUrls.add(url)
       this.notesService.getLinkPreview(url)
         .then(preview => {
           if (!this.isLiveEditorPreviewSlot(slot, generation)) return
@@ -2289,6 +2294,11 @@ export class InputComponent implements OnInit {
       && !!body
       && slot.isConnected
       && body.contains(slot)
+  }
+
+  private releaseEditorPreviewInterests() {
+    for (const url of this.editorPreviewUrls) this.notesService.releaseLinkPreview(url)
+    this.editorPreviewUrls.clear()
   }
 
   private editorPreviewShell(url: string) {
@@ -4000,6 +4010,7 @@ export class InputComponent implements OnInit {
     for (const handle of this.backgroundSaveHandles) void handle.remove()
     this.backgroundSaveHandles = []
     this.editorPreviewGeneration++;
+    this.releaseEditorPreviewInterests();
     if (this.editorLinkDecorationFrame) {
       cancelAnimationFrame(this.editorLinkDecorationFrame);
       this.editorLinkDecorationFrame = undefined;
