@@ -8,7 +8,7 @@ function createStore(database = new IDBFactory()) {
   const values = new Map();
   const localStorage = {getItem:key=>values.get(key) || null,setItem:(key,value)=>values.set(key,String(value)),removeItem:key=>values.delete(key)};
   const window = Object.assign(new EventTarget(),{location:{origin:'https://kept.test'}});
-  const globals = {console,indexedDB:database,IDBKeyRange,localStorage,window,navigator:{onLine:true},crypto:globalThis.crypto,
+  const globals = {console,indexedDB:database,IDBKeyRange,localStorage,window,navigator:{onLine:true},crypto:globalThis.crypto,performance:globalThis.performance,
     Blob,URL,Date,Promise,Map,Set,TypeError,Error,Uint8Array,setTimeout,clearTimeout};
   function load(filename) {
     filename=path.resolve(filename);

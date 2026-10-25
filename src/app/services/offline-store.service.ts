@@ -5,6 +5,7 @@ import { NoteAttachmentI, NoteI } from '../interfaces/notes';
 import { ReminderI } from '../interfaces/reminder';
 import type { LocationSavedPlace } from './location-saved-places.service';
 import { createUuid } from '../utils/uuid';
+import { perf } from '../utils/perf';
 import { createDemoNotes, demoWelcomeText } from '../utils/demo-notes';
 import { CatalogItem, MutationOutcome, NativeAction, ResourceChange, ResourceType, RESOURCE_STORES, Workspace } from '../interfaces/workspace';
 
@@ -56,10 +57,25 @@ type SyncState = {
   serverOffsetMs: number;
 };
 
+/** What one reconciliation actually changed, for scoped cache invalidation. */
+export interface ReconcileSummary {
+  /** True when visible resource rows changed and consumers must refresh. */
+  changed: boolean;
+  /** Sync ids of the notes whose visible row changed or disappeared. */
+  noteSyncIds: string[];
+  remindersChanged: boolean;
+  labelsChanged: boolean;
+  bindersChanged: boolean;
+  savedPlacesChanged: boolean;
+  preferencesChanged: boolean;
+  /** Diagnostics: how many note rows this reconciliation rewrote. */
+  notesRewritten: number;
+}
+
 @Injectable({ providedIn: 'root' })
 export class OfflineStoreService {
   private readonly databaseName = 'kept-offline-v1';
-  private readonly databaseVersion = 3;
+  private readonly databaseVersion = 4;
   private database?: Promise<IDBDatabase>;
   private lastStampPhysicalMs = 0;
   private lastStampLogical = 0;
@@ -142,15 +158,32 @@ export class OfflineStoreService {
   }
 
   async getNote(partition: string, id: number) {
-    const notes = await this.listNotes(partition);
-    return notes.find(note => note.id === id);
+    const db = await this.open();
+    const rows = await this.request<StoredResource<NoteI>[]>(
+      db.transaction('notes').objectStore('notes').index('byId').getAll(IDBKeyRange.only([partition, id]))
+    );
+    return rows.reduce<NoteI | undefined>((best, row) => (best ? this.preferNote(best, row.value) : row.value), undefined);
+  }
+
+  /** Point lookup used by incremental UI updates; no full partition scan. */
+  async getNoteBySyncId(partition: string, syncId: string) {
+    const db = await this.open();
+    const row = await this.request<StoredResource<NoteI> | undefined>(
+      db.transaction('notes').objectStore('notes').get(this.resourceKey(partition, syncId))
+    );
+    return row?.value;
+  }
+
+  private async noteRowsById(partition: string, id: number) {
+    const db = await this.open();
+    return this.request<StoredResource<NoteI>[]>(
+      db.transaction('notes').objectStore('notes').index('byId').getAll(IDBKeyRange.only([partition, id]))
+    );
   }
 
   async putNote(partition: string, note: NoteI) {
     const syncId = this.ensureNoteIdentity(note);
-    const existing = note.id != null
-      ? (await this.listRecords<NoteI>('notes', partition)).filter(record => record.value.id === note.id)
-      : [];
+    const existing = note.id != null ? await this.noteRowsById(partition, note.id) : [];
     const preferred = existing.reduce<NoteI | undefined>((best, record) => {
       if (!best) return record.value;
       return this.preferNote(best, record.value);
@@ -167,9 +200,7 @@ export class OfflineStoreService {
 
   async overwriteNoteMetadata(partition: string, note: NoteI) {
     const syncId = this.ensureNoteIdentity(note);
-    const existing = note.id != null
-      ? (await this.listRecords<NoteI>('notes', partition)).filter(record => record.value.id === note.id)
-      : [];
+    const existing = note.id != null ? await this.noteRowsById(partition, note.id) : [];
     const db = await this.open();
     await this.transaction(db, ['notes'], 'readwrite', stores => {
       existing
@@ -291,6 +322,8 @@ export class OfflineStoreService {
   async cacheMedia(partition: string, canonicalUrl: string, requestUrl: string) {
     if (!canonicalUrl || canonicalUrl.startsWith('data:') || canonicalUrl.startsWith('blob:')) return;
     try {
+      // Media URLs are stable upload paths: never re-download cached media.
+      if (await this.getBlob(partition, `media:${canonicalUrl}`)) return;
       const response = await fetch(requestUrl, { credentials: Capacitor.isNativePlatform() ? 'same-origin' : 'include' });
       if (!response.ok) return;
       await this.putBlob(partition, `media:${canonicalUrl}`, await response.blob());
@@ -753,8 +786,8 @@ export class OfflineStoreService {
     workspace: Workspace,
     input: { snapshot?: Partial<Record<ResourceType, Record<string, any>[]>>; changes?: ResourceChange[];
       results?: MutationOutcome[]; sent?: OutboxEntry[]; cursor?: number; serverTime?: number }
-  ) {
-    await this.atomic([...Object.values(RESOURCE_STORES), 'baseline', 'outbox', 'syncState', 'workspaces', 'conflicts'], async tx => {
+  ): Promise<ReconcileSummary> {
+    return this.atomic([...Object.values(RESOURCE_STORES), 'baseline', 'outbox', 'syncState', 'workspaces', 'conflicts'], async tx => {
       const partition = workspace.partition;
       const meta = await this.request<Workspace | undefined>(tx.objectStore('workspaces').get(workspace.id));
       if (!meta || meta.generation !== workspace.generation || meta.status !== 'active') throw new Error('Obsolete synchronization response.');
@@ -766,7 +799,9 @@ export class OfflineStoreService {
       const putBase = (type: ResourceType, syncId: string, value: any) => {
         baseline.put({ key: `${partition}|${type}|${syncId}`, partition, resourceType: type, syncId, value }); mark(type, syncId);
       };
+      let snapshotApplied = false;
       if (input.snapshot && !obsolete) {
+        snapshotApplied = true;
         const old = await this.request<any[]>(baseline.index('partition').getAll(partition));
         for (const row of old) {
           if (input.snapshot[row.resourceType as ResourceType] !== undefined) { baseline.delete(row.key); mark(row.resourceType, row.syncId); }
@@ -777,11 +812,12 @@ export class OfflineStoreService {
           for (const value of values) if (value.syncId) putBase(type, value.syncId, value);
         }
       }
-      for (const change of (input.changes || []).filter(change => !obsolete && change.sequence > (priorState?.cursor || 0))) putBase(change.resourceType, change.resourceSyncId, change.operation === 'delete' ? null : change.payload);
+      const appliedChanges = (input.changes || []).filter(change => !obsolete && change.sequence > (priorState?.cursor || 0));
+      for (const change of appliedChanges) putBase(change.resourceType, change.resourceSyncId, change.operation === 'delete' ? null : change.payload);
       const sent = new Map((input.sent || []).map(entry => [entry.operationId, entry]));
-      for (const outcome of input.results || []) {
-        const operation = sent.get(outcome.operationId);
-        if (!operation || !outcome.ok) continue;
+      const appliedResults = (input.results || []).filter(outcome => outcome.ok && sent.has(outcome.operationId));
+      for (const outcome of appliedResults) {
+        const operation = sent.get(outcome.operationId)!;
         tx.objectStore('outbox').delete(operation.key);
         const type = operation.type.split('.')[0] as ResourceType;
         if (operation.type !== 'note.reorder' && !obsolete) {
@@ -790,45 +826,169 @@ export class OfflineStoreService {
         }
         if (outcome.skipped) tx.objectStore('conflicts').put({ key: `${partition}|${operation.operationId}`, partition, operation, canonical: outcome.canonical, reason: 'The server retained a newer version.' });
       }
+      const advanceCursor = () => {
+        const cursor = Math.max(input.cursor || 0, priorState?.cursor || 0);
+        const serverOffsetMs = input.serverTime ? input.serverTime - Date.now() : priorState?.serverOffsetMs || 0;
+        if (cursor !== (priorState?.cursor || 0) || serverOffsetMs !== (priorState?.serverOffsetMs || 0)) {
+          tx.objectStore('syncState').put({ key: partition, partition, cursor, serverOffsetMs });
+        }
+      };
+      const summary: ReconcileSummary = {
+        changed: false, noteSyncIds: [], remindersChanged: false, labelsChanged: false,
+        bindersChanged: false, savedPlacesChanged: false, preferencesChanged: false, notesRewritten: 0
+      };
+      // No effective server work: keep cursor/offset bookkeeping in this one
+      // small write and skip the projection and materialization passes entirely.
+      if (!snapshotApplied && !appliedChanges.length && !appliedResults.length) {
+        advanceCursor();
+        return summary;
+      }
+
       const pending = await this.request<OutboxEntry[]>(tx.objectStore('outbox').index('partition').getAll(partition));
       pending.sort((a, b) => a.createdAt - b.createdAt || a.operationId.localeCompare(b.operationId));
-      for (const operation of pending) if (!['note.reorder', 'attachment.upload', 'image.upload'].includes(operation.type)) mark(operation.type.split('.')[0] as ResourceType, operation.syncId);
+      const pendingByResource = new Map<string, OutboxEntry[]>();
+      for (const operation of pending) {
+        if (['note.reorder', 'attachment.upload', 'image.upload'].includes(operation.type)) continue;
+        const key = `${operation.type.split('.')[0]}|${operation.syncId}`;
+        const list = pendingByResource.get(key);
+        if (list) list.push(operation); else pendingByResource.set(key, [operation]);
+        mark(operation.type.split('.')[0] as ResourceType, operation.syncId);
+      }
+
+      const noteStore = tx.objectStore('notes');
+      const changedNoteSyncIds = new Set<string>();
+      const changedResources = new Set<ResourceType>();
+      const attachmentNoteLinks = new Map<string, { noteId?: number; noteSyncId?: string }>();
+      const rememberAttachmentLink = (value: any, previous: any) => {
+        const noteId = value?.noteId ?? previous?.noteId;
+        const noteSyncId = value?.noteSyncId ?? previous?.noteSyncId;
+        if (noteId != null || noteSyncId) attachmentNoteLinks.set(`${noteSyncId || ''}|${noteId ?? ''}`, { noteId, noteSyncId });
+      };
+      const touchResource = (type: ResourceType, syncId: string) => {
+        summary.changed = true;
+        changedResources.add(type);
+        if (type === 'note') changedNoteSyncIds.add(syncId);
+      };
       // Project notes first so related reminders/attachments can use canonical note IDs.
       for (const { type, syncId } of [...affected.values()].sort((a, b) => Number(b.type === 'note') - Number(a.type === 'note'))) {
         const record = await this.request<any>(baseline.get(`${partition}|${type}|${syncId}`));
         let value = record?.value || null;
-        for (const op of pending.filter(op => op.syncId === syncId && op.type.split('.')[0] === type && op.type !== 'attachment.upload')) {
+        for (const op of pendingByResource.get(`${type}|${syncId}`) || []) {
           value = op.type.endsWith('.delete') ? null : { ...value, ...(op.payload as any), ...(value?.id > 0 ? { id: value.id } : {}) };
         }
         const store = tx.objectStore(RESOURCE_STORES[type]);
-        if (!value) { store.delete(this.resourceKey(partition, syncId)); continue; }
-        if ((type === 'reminder' || type === 'attachment') && value.noteSyncId) {
-          const note = await this.request<StoredResource<any> | undefined>(tx.objectStore('notes').get(this.resourceKey(partition, value.noteSyncId)));
-          if (note) value.noteId = note.value.id;
-          else {store.delete(this.resourceKey(partition,syncId));continue;}
+        const key = this.resourceKey(partition, syncId);
+        const previousRow = await this.request<StoredResource<any> | undefined>(store.get(key));
+        if (type === 'attachment') rememberAttachmentLink(value, previousRow?.value);
+        if (!value) {
+          if (previousRow) { store.delete(key); touchResource(type, syncId); }
+          continue;
         }
-        store.put({ key: this.resourceKey(partition, syncId), partition, syncId, value });
+        if ((type === 'reminder' || type === 'attachment') && value.noteSyncId) {
+          const note = await this.request<StoredResource<any> | undefined>(noteStore.get(this.resourceKey(partition, value.noteSyncId)));
+          if (note) value.noteId = note.value.id;
+          else {
+            if (previousRow) { store.delete(key); touchResource(type, syncId); }
+            continue;
+          }
+        }
+        // Echoed writes that match the stored projection are not visible
+        // changes: skip the row write entirely.
+        if (previousRow && JSON.stringify(previousRow.value) === JSON.stringify(value)) continue;
+        store.put({ key, partition, syncId, value });
+        touchResource(type, syncId);
+        if (type === 'note') summary.notesRewritten++;
       }
-      const notes = await this.request<StoredResource<any>[]>(tx.objectStore('notes').index('partition').getAll(partition));
+
+      // Materialize attachments and label catalog entries only into the notes
+      // that can have changed, using indexed lookup maps instead of repeated
+      // whole-collection scans.
       const attachmentRows = await this.request<StoredResource<any>[]>(tx.objectStore('attachments').index('partition').getAll(partition));
-      const labels = await this.request<StoredResource<any>[]>(tx.objectStore('labels').index('partition').getAll(partition));
-      for (const row of notes) {
-        row.value.attachments = attachmentRows.filter(item => item.value.noteId === row.value.id || item.value.noteSyncId === row.syncId).map(item => ({...item.value,noteId:row.value.id}));
-        row.value.labels = (row.value.labels || []).map((label:any) => {
-          const catalog = labels.find(item => item.syncId === label.syncId);
-          return catalog ? { ...label, ...catalog.value, added: label.added } : label;
+      const attachmentOrder = new Map(attachmentRows.map((row, index) => [row.syncId, index]));
+      const attachmentsByNoteId = new Map<number, StoredResource<any>[]>();
+      const attachmentsByNoteSyncId = new Map<string, StoredResource<any>[]>();
+      for (const row of attachmentRows) {
+        if (row.value.noteId != null) {
+          const list = attachmentsByNoteId.get(row.value.noteId) || [];
+          list.push(row);
+          attachmentsByNoteId.set(row.value.noteId, list);
+        }
+        if (row.value.noteSyncId) {
+          const list = attachmentsByNoteSyncId.get(row.value.noteSyncId) || [];
+          list.push(row);
+          attachmentsByNoteSyncId.set(row.value.noteSyncId, list);
+        }
+      }
+      const materializedAttachments = (row: StoredResource<any>) => {
+        const merged = new Map<string, any>();
+        for (const item of attachmentsByNoteId.get(row.value.id) || []) merged.set(item.syncId, item.value);
+        for (const item of attachmentsByNoteSyncId.get(row.syncId) || []) merged.set(item.syncId, item.value);
+        return [...merged.entries()]
+          .sort((left, right) => (attachmentOrder.get(left[0]) ?? 0) - (attachmentOrder.get(right[0]) ?? 0))
+          .map(([, value]) => ({ ...value, noteId: row.value.id }));
+      };
+      const labelRows = await this.request<StoredResource<any>[]>(tx.objectStore('labels').index('partition').getAll(partition));
+      const labelBySyncId = new Map(labelRows.map(row => [row.syncId, row.value]));
+
+      const candidates = new Map<string, StoredResource<any>>();
+      const addCandidate = async (syncId: string) => {
+        if (candidates.has(syncId)) return;
+        const row = await this.request<StoredResource<any> | undefined>(noteStore.get(this.resourceKey(partition, syncId)));
+        if (row) candidates.set(syncId, row);
+      };
+      for (const syncId of changedNoteSyncIds) await addCandidate(syncId);
+      for (const link of attachmentNoteLinks.values()) {
+        if (link.noteSyncId) await addCandidate(link.noteSyncId);
+        else if (link.noteId != null) {
+          const row = await this.request<StoredResource<any> | undefined>(noteStore.index('byId').get(IDBKeyRange.only([partition, link.noteId])));
+          if (row) candidates.set(row.syncId, row);
+        }
+      }
+      // A catalog label change can affect any note that applies it.
+      if ([...affected.values()].some(entry => entry.type === 'label')) {
+        for (const row of await this.request<StoredResource<any>[]>(noteStore.index('partition').getAll(partition))) candidates.set(row.syncId, row);
+      }
+      for (const row of candidates.values()) {
+        const attachments = materializedAttachments(row);
+        const labels = (row.value.labels || []).map((label: any) => {
+          const catalog = labelBySyncId.get(label.syncId);
+          return catalog ? { ...label, ...catalog, added: label.added } : label;
         });
-        tx.objectStore('notes').put(row);
+        if (JSON.stringify(row.value.attachments || []) === JSON.stringify(attachments) &&
+            JSON.stringify(row.value.labels || []) === JSON.stringify(labels)) continue;
+        row.value = { ...row.value, attachments, labels };
+        noteStore.put(row);
+        touchResource('note', row.syncId);
+        summary.notesRewritten++;
       }
       for (const op of pending.filter(op => op.type === 'note.reorder')) {
         const order = (op.payload as any).syncIds as string[];
-        for (const row of notes) { const index = order.indexOf(row.syncId); if (index >= 0) { row.value.sortOrder = op.createdAt + order.length - index; tx.objectStore('notes').put(row); } }
+        for (const [index, syncId] of order.entries()) {
+          let row = candidates.get(syncId);
+          if (!row) {
+            row = await this.request<StoredResource<any> | undefined>(noteStore.get(this.resourceKey(partition, syncId)));
+            if (row) candidates.set(syncId, row);
+          }
+          if (!row) continue;
+          const sortOrder = op.createdAt + order.length - index;
+          if (row.value.sortOrder === sortOrder) continue;
+          row.value = { ...row.value, sortOrder };
+          noteStore.put(row);
+          touchResource('note', syncId);
+          summary.notesRewritten++;
+        }
       }
-      const previous = await this.request<SyncState | undefined>(tx.objectStore('syncState').get(partition));
-      tx.objectStore('syncState').put({ key: partition, partition, cursor: Math.max(input.cursor || 0,previous?.cursor || 0),
-        serverOffsetMs: input.serverTime ? input.serverTime - Date.now() : previous?.serverOffsetMs || 0 });
+
+      advanceCursor();
       meta.revision++;
       tx.objectStore('workspaces').put(meta);
+      summary.noteSyncIds = [...changedNoteSyncIds];
+      summary.remindersChanged = changedResources.has('reminder');
+      summary.labelsChanged = changedResources.has('label');
+      summary.bindersChanged = changedResources.has('binder');
+      summary.savedPlacesChanged = changedResources.has('savedPlace');
+      summary.preferencesChanged = changedResources.has('preferences');
+      return summary;
     });
   }
 
@@ -842,14 +1002,14 @@ export class OfflineStoreService {
 
   private async atomic<T>(stores: string[], work: (tx: IDBTransaction) => Promise<T>): Promise<T> {
     const db = await this.open();
-    return new Promise<T>((resolve, reject) => {
+    return perf.time('idb.transaction', stores[0], () => new Promise<T>((resolve, reject) => {
       const tx = this.beginTransaction(db, [...new Set(stores)], 'readwrite');
       let value: T;
       tx.oncomplete = () => resolve(value);
       tx.onerror = () => reject(tx.error || new Error('Local write failed.'));
       tx.onabort = () => reject(tx.error || new Error('Local write was aborted.'));
       work(tx).then(result => { value = result; }, error => { try { tx.abort(); } catch {} reject(error); });
-    });
+    }));
   }
 
   private resourceKey(partition: string, syncId: string) {
@@ -949,6 +1109,9 @@ export class OfflineStoreService {
           }
           if (!db.objectStoreNames.contains('workspaces')) db.createObjectStore('workspaces', { keyPath: 'id' });
           if (!db.objectStoreNames.contains('syncState')) db.createObjectStore('syncState', { keyPath: 'key' });
+          // Point lookups by note id (getNote/putNote) must not scan the partition.
+          const notes = request.transaction!.objectStore('notes');
+          if (!notes.indexNames.contains('byId')) notes.createIndex('byId', ['partition', 'value.id'], { unique: false });
         };
         request.onblocked = () => reject(new Error('Close other Kept windows to finish the storage upgrade.'));
         request.onsuccess = () => {

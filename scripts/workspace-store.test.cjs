@@ -105,7 +105,7 @@ test('an additive schema upgrade preserves an existing outbox, cursor and blob',
  assert.equal((await store.listOutbox('server'))[0].operationId,'legacy');
  assert.equal((await store.getSyncState('server')).cursor,123);
  assert.equal(await(await store.getBlob('server','file')).text(),'original');
- assert.equal((await store.open()).version,3);
+ assert.equal((await store.open()).version,4);
 });
 
 test('fresh local libraries seed once, preserve sample files and can trash all demos together',async()=>{
