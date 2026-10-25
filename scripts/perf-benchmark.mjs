@@ -104,7 +104,9 @@ try {
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await page.locator('app-notes .note-container').first().waitFor();
   const firstNotesMs = Date.now() - loginStart;
-  await page.waitForTimeout(4000); // let the startup sync settle
+  // Let the startup sync finish (longer for large libraries).
+  await page.waitForFunction(() => window.__keptPerf && !!window.__keptPerf.snapshot()['sync.cycle'], null, { timeout: 120000 }).catch(() => {});
+  await page.waitForTimeout(4000);
   summary.coldStart = { firstNotesMs, ...(await snap()) };
 
   // 2. Reopen (reload) with an up-to-date local cache and zero server changes.
@@ -113,6 +115,7 @@ try {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.locator('app-notes .note-container').first().waitFor();
   const reopenNotesMs = Date.now() - reopenStart;
+  await page.waitForFunction(() => window.__keptPerf && !!window.__keptPerf.snapshot()['sync.cycle'], null, { timeout: 120000 }).catch(() => {});
   await page.waitForTimeout(4000);
   summary.reopen = { firstNotesMs: reopenNotesMs, ...(await snap()) };
 
@@ -127,7 +130,7 @@ try {
     }
     await route.continue();
   });
-  await page.getByText('Bench 1', { exact: true }).click();
+  await page.getByText(`Bench ${noteCount - 1}`, { exact: true }).click();
   const editor = page.locator('app-input .note-main:visible').last();
   await editor.locator('.note-body[contenteditable]').fill('Edited for the benchmark');
   await page.evaluate(() => window.__benchReset());
