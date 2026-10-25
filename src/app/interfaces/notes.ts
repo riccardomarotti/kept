@@ -60,6 +60,7 @@ export interface NoteAttachmentI {
     id: number
     syncId?: string
     noteId?: number
+    noteSyncId?: string
     originalName: string
     fileSize: number
     mimeType: string

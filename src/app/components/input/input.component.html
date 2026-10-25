@@ -34,7 +34,7 @@
       <div #noteContainer class="drawing-editor">
         <div #noteTitle hidden></div>
         <div class="drawing-toolbar">
-          <button type="button" class="drawing-icon back" aria-label="Back" (click)="saveNote()">
+          <button type="button" class="drawing-icon back" aria-label="Back" [disabled]="closeSaveBusy" [attr.aria-busy]="closeSaveBusy" (click)="saveNote()">
             <span class="material-symbols-outlined">arrow_back</span>
           </button>
           <button type="button" class="drawing-icon select" [class.active]="drawingTool === 'select'" aria-label="Select"
@@ -149,10 +149,13 @@
     <div #noteContainer class="note-container" [class.mobile-new-note-empty]="showMobileNewNoteStarters()">
       <!--? Mobile Top Bar -->
       <div class="mobile-top-bar">
-        <button type="button" class="mobile-icon back" (click)="mobileBack()">
+        <button type="button" class="mobile-icon back" [disabled]="closeSaveBusy" [attr.aria-busy]="closeSaveBusy" (click)="mobileBack()">
           <span class="material-symbols-outlined">arrow_back</span>
         </button>
         <span class="spacer"></span>
+        @if (saveStatus !== 'idle') {
+          <span class="save-status" [class.is-error]="saveStatus === 'error'" role="status" aria-live="polite">{{ saveStatusText() }}</span>
+        }
         <div class="mobile-top-icons">
           <button type="button" class="mobile-icon history" aria-label="Undo"
             (pointerdown)="runTextHistory('undo',$event)">
@@ -291,7 +294,7 @@
           <button type="button" class="dc-confirm" (click)="confirmPendingDate()">Pick time →</button>
         </div>
       }
-      <button type="button" class="close-btn" [disabled]="!canSaveNote" (click)="saveNote()">Close</button>
+      <button type="button" class="close-btn" [disabled]="!canSaveNote || closeSaveBusy" [attr.aria-busy]="closeSaveBusy" (click)="saveNote()">{{ closeSaveBusy ? 'Saving…' : 'Close' }}</button>
     </div>
 
     <!--? Mobile Bottom Bar -->

@@ -26,6 +26,7 @@ import { ensureTimepickerWheelPlugin } from 'src/app/utils/timepicker-wheel';
 import { MAX_INDENT_LEVEL, descendantIndexes, maxIndentLevelAt, normalizeIndentLevel, normalizeIndentLevels } from 'src/app/utils/checkbox-indent';
 import { environment } from 'src/environments/environment';
 import { createUuid } from 'src/app/utils/uuid';
+import { perf } from 'src/app/utils/perf';
 import type { LocationPin } from '../location-map-picker/location-map-picker.component';
 
 declare var Snackbar: any;
@@ -246,6 +247,10 @@ export class InputComponent implements OnInit {
   preferencesSubscription?: Subscription;
   private saveQueue: Promise<boolean | void> = Promise.resolve();
   private editorGeneration = 0;
+  // Local-save feedback: "Saving…", "Saved" and an actionable failure state.
+  saveStatus: 'idle' | 'saving' | 'saved' | 'error' = 'idle';
+  closeSaveBusy = false;
+  private saveStatusTimer?: ReturnType<typeof setTimeout>;
   private newNoteId?: number;
   private newNoteSyncId?: string;
   private backgroundSaveHandles: PluginListenerHandle[] = [];
@@ -513,20 +518,57 @@ export class InputComponent implements OnInit {
 
   saveNote(closeAfterSave = true): Promise<boolean | void> {
     const generation = this.editorGeneration
+    this.setSaveStatus('saving')
+    if (closeAfterSave) this.closeSaveBusy = true
     // Close, background events and typing can all request a save together.
     // Serialize them so a new note is created once and later saves update it.
     const save = this.saveQueue.then(() => {
       if (this.destroyed || generation !== this.editorGeneration) return
-      return this.persistNote(closeAfterSave)
+      return perf.time('editor.save', closeAfterSave ? 'close' : 'autosave', () => this.persistNote(closeAfterSave))
+    }).then(result => {
+      if (result === false) {
+        this.closeSaveBusy = false
+        this.setSaveStatus('error')
+        return false
+      }
+      this.setSaveStatus('saved')
+      return result
     }).catch(error => {
+      this.closeSaveBusy = false
       if (!this.auth.isAuthExpiredError(error)) {
         console.error('Could not save note', error)
         this.showNoteSaveError()
+        this.setSaveStatus('error')
+      } else {
+        this.setSaveStatus('idle')
       }
       return false
     })
     this.saveQueue = save
     return save
+  }
+
+  saveStatusText() {
+    switch (this.saveStatus) {
+      case 'saving': return 'Saving…'
+      case 'saved': return 'Saved'
+      case 'error': return 'Couldn’t save'
+      default: return ''
+    }
+  }
+
+  private setSaveStatus(status: 'idle' | 'saving' | 'saved' | 'error') {
+    this.saveStatus = status
+    if (this.saveStatusTimer) {
+      clearTimeout(this.saveStatusTimer)
+      this.saveStatusTimer = undefined
+    }
+    if (status === 'saved') {
+      this.saveStatusTimer = setTimeout(() => {
+        this.saveStatusTimer = undefined
+        if (this.saveStatus === 'saved') this.saveStatus = 'idle'
+      }, 2500)
+    }
   }
 
   private currentNoteId(): number | undefined {
@@ -999,6 +1041,8 @@ export class InputComponent implements OnInit {
 
   reset() {
     this.editorGeneration++
+    this.closeSaveBusy = false
+    this.setSaveStatus('idle')
     this.clearComposerDraft()
     this.newNoteId = undefined
     this.newNoteSyncId = undefined

@@ -38,9 +38,10 @@ import { AuthService } from './auth.service';
 import { ShareUserI } from '../interfaces/users';
 import { ReminderService } from './reminder.service';
 import { OfflineStoreService } from './offline-store.service';
-import { OfflineSyncService } from './offline-sync.service';
+import { CacheChange, OfflineSyncService } from './offline-sync.service';
 import { UserPreferencesService } from './user-preferences.service';
 import { createUuid } from '../utils/uuid';
+import { perf } from '../utils/perf';
 
 const KeptDownloads = registerPlugin<KeptDownloadsPlugin>('KeptDownloads');
 
@@ -87,8 +88,8 @@ export class NotesService {
     private offlineSync: OfflineSyncService,
     private preferences: UserPreferencesService
   ) {
-    this.offlineSync.cacheChanged$.subscribe(() => {
-      this.publishCachedNotes(this.searchQuery).catch(console.error);
+    this.offlineSync.cacheChanged$.subscribe(change => {
+      void perf.time('notes.cacheChangeFanOut', change?.noteSyncIds ? 'scoped' : 'full', () => this.applyCacheChange(change));
     });
     this.authSubscription = this.auth.accessChanges$.subscribe(user => {
       const identity = `${this.offlineSync.partition}:${this.offlineSync.generation || ''}`;
@@ -453,7 +454,7 @@ export class NotesService {
     if (this.offlineSync.writesLocally) {
       const value = this.canonicalizeNoteMedia({ ...noteObj, id: undefined, isCardPreview: false, syncId: noteObj.syncId || `note-${createUuid()}` });
       const saved = await this.offlineSync.commit('note.upsert', value.syncId, value);
-      await this.load();
+      this.upsertNoteInList(await this.hydrateOfflineNoteMedia(saved));
       return saved.id!;
     }
     noteObj = this.canonicalizeNoteMedia(noteObj);
@@ -522,7 +523,9 @@ export class NotesService {
       const local = this.canonicalizeNoteMedia({ ...existing, ...object, id, isCardPreview: false });
       await this.offlineSync.commit('note.upsert', existing.syncId, local);
       await this.reminders.refreshNoteContent(local);
-      await this.load();
+      // Update the visible note immediately and incrementally; a full list
+      // reload on every save is what used to make closing an editor slow.
+      this.upsertNoteInList(await this.hydrateOfflineNoteMedia(local));
       return;
     }
     object = this.canonicalizeNoteMedia(object);
@@ -536,6 +539,20 @@ export class NotesService {
     await this.reminders.refreshNoteContent(local);
     if (id < 0 || !navigator.onLine) {
       await this.offlineSync.enqueue('note.upsert', local.syncId!, local);
+      return;
+    }
+    // Journal the edit durably before any network work so saving and closing
+    // never wait on the server. The journal entry is dropped once the write
+    // lands and replayed by the outbox if the request never does.
+    const journal = this.offlineSync.partition
+      ? await this.offlineSync.enqueue('note.upsert', local.syncId!, local, { deferSync: true })
+      : undefined;
+    if (journal) {
+      this.suppressRealtimeReload(id);
+      void this.deliverLegacyWrite(id, () => this.withTimeout(
+        firstValueFrom(this.http.put(`${this.apiUrl}/${id}`, object, { headers: this.auth.authHeaders() })),
+        this.noteWriteTimeoutMs
+      ), `update note ${id}`, journal, object);
       return;
     }
     this.suppressRealtimeReload(id);
@@ -564,6 +581,27 @@ export class NotesService {
     }
   }
 
+  /** Deliver a journaled legacy write in the background, retrying via the outbox. */
+  private async deliverLegacyWrite(id: number, write: () => Promise<unknown>, label: string, journal: { operationId: string }, object: NoteI) {
+    try {
+      await this.noteWriteWithRetry(write, label);
+      this.offlineSync.clearConnectionDegraded();
+      if (this.offlineSync.partition) await this.offlineStore.removeOutbox([`${this.offlineSync.partition}|${journal.operationId}`]);
+      this.mergeNoteIntoList({ ...object, id });
+      this.scheduleIosReminderRefresh(id);
+    } catch (error) {
+      this.suppressedRealtimeReloads.delete(id);
+      if (this.auth.notifySessionExpired(error)) return;
+      if (this.isOfflineError(error)) {
+        // The journal keeps the edit safe; recovery flushes it exactly once.
+        this.offlineSync.markConnectionDegraded();
+        void this.offlineSync.syncNow({ drain: true, reason: 'journal-retry' }).catch(console.error);
+        return;
+      }
+      console.log(error);
+    }
+  }
+
   async updateKey(object: UpdateKeyI, id: number) {
     if (this.offlineSync.writesLocally) return this.update(object as NoteI, id);
     object = this.canonicalizeNoteMedia(object);
@@ -577,6 +615,18 @@ export class NotesService {
     await this.reminders.refreshNoteContent(local);
     if (id < 0 || !navigator.onLine) {
       await this.offlineSync.enqueue('note.upsert', local.syncId!, local);
+      return;
+    }
+    // See update(): the journal makes the field change durable immediately.
+    const journal = this.offlineSync.partition
+      ? await this.offlineSync.enqueue('note.upsert', local.syncId!, local, { deferSync: true })
+      : undefined;
+    if (journal) {
+      this.suppressRealtimeReload(id);
+      void this.deliverLegacyWrite(id, () => this.withTimeout(
+        firstValueFrom(this.http.patch(`${this.apiUrl}/${id}`, object, { headers: this.auth.authHeaders() })),
+        this.noteWriteTimeoutMs
+      ), `update note fields ${id}`, journal, object as NoteI);
       return;
     }
     this.suppressRealtimeReload(id);
@@ -631,7 +681,7 @@ export class NotesService {
       const notes = await this.offlineStore.listNotes(this.offlineSync.partition);
       const syncIds = ids.map(id => notes.find(note => note.id === id)?.syncId).filter(Boolean);
       await this.offlineSync.commit('note.reorder', 'note-order', { syncIds });
-      await this.load(); return;
+      await this.scheduleFullPublish(); return;
     }
     if (!ids.length) return;
     try {
@@ -713,7 +763,8 @@ export class NotesService {
         noteId, noteSyncId: note.syncId, originalName: resolvedName,
         fileSize: stored.size, mimeType: stored.type, uploadedAt: new Date().toISOString()
       }, { blobs: [{ key: `attachment:${syncId}`, value: stored }] });
-      await this.load(); return value as unknown as NoteAttachmentI;
+      await this.applyNoteChanges([note.syncId!]);
+      return value as unknown as NoteAttachmentI;
     }
     const syncId = `attachment-${createUuid()}`;
     const note = await this.cachedOrLoadedNote(noteId);
@@ -776,7 +827,8 @@ export class NotesService {
       const rows = await this.offlineStore.listResources<NoteAttachmentI>('attachment', this.offlineSync.partition);
       const value = rows.find(item => item.id === attachmentId && item.noteId === noteId);
       if (value?.syncId) await this.offlineSync.commit('attachment.delete', value.syncId, value);
-      await this.load(); return;
+      if (value?.noteSyncId) await this.applyNoteChanges([value.noteSyncId]);
+      return;
     }
     const note = await this.cachedOrLoadedNote(noteId);
     const attachment = note?.attachments?.find(item => item.id === attachmentId);
@@ -1224,7 +1276,8 @@ export class NotesService {
       const value = await this.offlineStore.getNote(this.offlineSync.partition, id);
       this.reminders.markNoteInactive(id);
       if (value?.syncId) await this.offlineSync.commit('note.delete', value.syncId, value);
-      await this.load(); await this.reminders.load(); return;
+      this.removeNoteFromListAndCache(id, value?.syncId || '').catch(console.error);
+      await this.reminders.load(); return;
     }
     if (id !== -1) {
       const note = await this.cachedOrLoadedNote(id);
@@ -1248,18 +1301,92 @@ export class NotesService {
     }
   }
 
-  private async publishCachedNotes(searchQuery: string) {
+  private async publishCachedNotes(searchQuery: string, trigger = 'publish') {
     if (!this.offlineSync.partition) return;
+    await perf.time('notes.publishCachedNotes', trigger, async () => {
+      const partition = this.offlineSync.partition;
+      const generation = this.offlineSync.generation;
+      const cached = await this.offlineStore.listNotes(partition);
+      if (partition !== this.offlineSync.partition || generation !== this.offlineSync.generation) return;
+      const hydrated = await perf.time('notes.mediaHydration', 'publish', () => Promise.all(cached.map(note => this.hydrateOfflineNoteMedia(note))));
+      if (partition !== this.offlineSync.partition || generation !== this.offlineSync.generation) return;
+      hydrated.sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.sortOrder || 0) - Number(a.sortOrder || 0));
+      this.nextCursor = null;
+      this.hasLoaded = true;
+      this.publishNotes(this.withOptimisticNotes(hydrated));
+    });
+  }
+
+  private publishScheduled?: Promise<void>;
+
+  /** Coalesce full publishes so a mutation and its sync echo refresh once. */
+  private scheduleFullPublish(): Promise<void> {
+    if (!this.publishScheduled) {
+      this.publishScheduled = this.publishCachedNotes(this.searchQuery, 'cache-change')
+        .catch(console.error)
+        .finally(() => { this.publishScheduled = undefined; });
+    }
+    return this.publishScheduled;
+  }
+
+  /** Refresh only what a cache change touched instead of the whole library. */
+  private async applyCacheChange(change: CacheChange | undefined) {
+    const scoped = !!change && !change.full && Array.isArray(change.noteSyncIds);
+    // Legacy protocol lists come from the server card endpoint; keep their
+    // established full-refresh behaviour.
+    if (!scoped || !this.offlineSync.writesLocally) {
+      await this.scheduleFullPublish();
+      return;
+    }
+    const syncIds = change.noteSyncIds!;
+    if (!syncIds.length) return;
+    await this.applyNoteChanges(syncIds);
+  }
+
+  private async applyNoteChanges(syncIds: string[]) {
+    if (!this.offlineSync.partition) return;
+    const current = this.notesList$.value;
+    // A broad change is cheaper to handle with one full publish.
+    if (!current || syncIds.length > Math.max(20, current.length / 4)) {
+      await this.scheduleFullPublish();
+      return;
+    }
     const partition = this.offlineSync.partition;
     const generation = this.offlineSync.generation;
-    const cached = await this.offlineStore.listNotes(partition);
-    if (partition !== this.offlineSync.partition || generation !== this.offlineSync.generation) return;
-    const hydrated = await Promise.all(cached.map(note => this.hydrateOfflineNoteMedia(note)));
-    if (partition !== this.offlineSync.partition || generation !== this.offlineSync.generation) return;
-    hydrated.sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.sortOrder || 0) - Number(a.sortOrder || 0));
-    this.nextCursor = null;
-    this.hasLoaded = true;
-    this.publishNotes(this.withOptimisticNotes(hydrated));
+    for (const syncId of syncIds) {
+      const note = await this.offlineStore.getNoteBySyncId(partition, syncId);
+      if (partition !== this.offlineSync.partition || generation !== this.offlineSync.generation) return;
+      if (!note) {
+        this.removeNoteFromListBySyncId(syncId);
+        continue;
+      }
+      const hydrated = await this.hydrateOfflineNoteMedia(note);
+      this.upsertNoteInList(hydrated);
+    }
+  }
+
+  /** Merge a note into the visible list, inserting new notes in sorted order. */
+  private upsertNoteInList(note: NoteI) {
+    const current = this.notesList$.value;
+    if (!current) return;
+    const index = current.findIndex(item => (note.id != null && item.id === note.id) || (!!note.syncId && item.syncId === note.syncId));
+    if (index >= 0) {
+      const next = [...current];
+      next[index] = { ...next[index], ...note, searchText: next[index].searchText };
+      this.publishNotes(next);
+      return;
+    }
+    const next = [...current, note];
+    next.sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.sortOrder || 0) - Number(a.sortOrder || 0));
+    this.publishNotes(next);
+  }
+
+  private removeNoteFromListBySyncId(syncId: string) {
+    const current = this.notesList$.value || [];
+    const next = current.filter(item => item.syncId !== syncId);
+    if (next.length !== current.length) this.publishNotes(next);
+    this.lastNonEmptyNotes = this.lastNonEmptyNotes.filter(item => item.syncId !== syncId);
+    for (const [id, note] of [...this.optimisticNotes]) if (note.syncId === syncId) this.optimisticNotes.delete(id);
   }
 
   private async cachedOrLoadedNote(id: number) {

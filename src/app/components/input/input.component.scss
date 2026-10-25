@@ -278,6 +278,20 @@
   display: none;
 }
 
+// Local-save feedback shown next to the editor's Back/Close controls.
+.save-status {
+  font-size: 12px;
+  opacity: 0.72;
+  padding: 2px 8px;
+  white-space: nowrap;
+
+  &.is-error {
+    opacity: 1;
+    color: #d93025;
+    font-weight: 500;
+  }
+}
+
 @mixin mobile-editor-bars {
   .mobile-top-bar {
     display: flex;

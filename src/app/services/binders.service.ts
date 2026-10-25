@@ -12,7 +12,10 @@ export class BindersService {
   private migratingLegacy = false;
   readonly items$ = new BehaviorSubject<CatalogItem[]>([]);
   constructor(private store: OfflineStoreService, public sync: OfflineSyncService,private auth: AuthService) {
-    this.sync.cacheChanged$.subscribe(() => this.load().catch(console.error));
+    this.sync.cacheChanged$.subscribe(change => {
+      if (change && !change.full && !change.binders) return;
+      this.load().catch(console.error);
+    });
   }
   async load() {
     if (!this.sync.partition) { this.items$.next([]); return; }

@@ -20,8 +20,8 @@
            show it only when saving needs attention. Server libraries keep every non-saved state. -->
       @if (auth.isLocal ? syncState === 'error' : syncState !== 'saved') {
         <div class="offline-sync-state" [class.is-error]="syncState === 'error'" role="status">
-          <span class="material-symbols-outlined">{{ syncState === 'offline' ? 'cloud_off' : syncState === 'error' ? 'sync_problem' : 'sync' }}</span>
-          <span>{{ syncState === 'error' ? (auth.isLocal ? 'Save needs attention' : 'Sync needs attention') : auth.isLocal ? 'Saved on this device' : syncState === 'offline' ? 'Saved offline' : 'Syncing' }}</span>
+          <span class="material-symbols-outlined">{{ syncState === 'offline' ? 'cloud_off' : syncState === 'error' ? 'sync_problem' : syncState === 'pending' ? 'task_alt' : 'sync' }}</span>
+          <span>{{ syncState === 'error' ? (auth.isLocal ? 'Save needs attention' : 'Sync needs attention') : auth.isLocal ? 'Saved on this device' : syncState === 'offline' ? 'Saved offline' : syncState === 'pending' ? 'Saved on this device' : 'Syncing' }}</span>
         </div>
       }
     }
